@@ -170,7 +170,7 @@ if not target then error("no such object/instance") end
 @mcp.tool()
 def move_object(object_id: int, dx: float = 0, dy: float = 0, dz: float = 0, instance_id: int | None = None) -> str:
     """Move an object instance by dx, dy, dz millimetres. Use list_objects to find ids."""
-    return _run(_select(object_id, instance_id) + f"target:translate({dx}, {dy}, {dz})\nlocal p = target:position()\nprint(string.format('%s now at (%.2f, %.2f, %.2f)', target.name, p.x, p.y, p.z))" + _BED_CHECK)
+    return _run(_select(object_id, instance_id) + f"target:translate({dx}, {dy}, {dz})\nlocal c = target:center()\nprint(string.format('%s now centered at (%.1f, %.1f)', target.name, c.x, c.y))" + _BED_CHECK)
 
 
 @mcp.tool()
