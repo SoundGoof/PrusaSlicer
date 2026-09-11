@@ -139,6 +139,11 @@ void UserAccountInteractor::on_action_retry(const Network::IHttp::Retry& retry)
     );
 }
 
+void UserAccountInteractor::request_connect_printers(std::function<void(const std::string&)> callback)
+{
+    m_communication->enqueue_connect_printers_data_action(std::move(callback));
+}
+
 void UserAccountInteractor::on_action_success(ActionSuccessType success_type, std::string body)
 {
     SPDLOG_INFO("UserAccountInteractor: Action success({})", static_cast<int>(success_type));

@@ -117,6 +117,12 @@ public:
 
     void request_printables_secret_token();
 
+    /**
+     * @brief Fetches the account's Connect printers; the callback receives the raw JSON body
+     * and may run on the network thread.
+     */
+    void request_connect_printers(std::function<void(const std::string&)> callback);
+
 private:
     void on_user_id(const std::string& body);
     void notify_action_retry_finished();

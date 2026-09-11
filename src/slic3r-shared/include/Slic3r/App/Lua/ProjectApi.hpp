@@ -14,6 +14,7 @@ struct ApiPermissions
 {
     bool export_files{false}; // api.project:export_gcode(path) may write anywhere on disk
     bool import_files{false}; // api.project:import_models(paths) may read model files anywhere on disk
+    bool send_to_printer{false}; // api.printers:send() may upload to printers and Prusa Connect
 };
 
 class ProjectApi

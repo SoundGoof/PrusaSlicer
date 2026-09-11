@@ -13,6 +13,13 @@
 #include "Slic3r/Biz/Lua/LuaException.hpp"
 #include "Slic3r/Biz/ResultExport/ExportNameParser.hpp"
 #include "Slic3r/Biz/ArrangeInteractor.hpp"
+#include "Slic3r/Biz/PhysicalPrinter/PhysicalPrinterInteractor.hpp"
+#include "Slic3r/Biz/PhysicalPrinter/PhysicalPrinterConfig.hpp"
+#include "Slic3r/Biz/PrintHost/PrintHostJobData.hpp"
+#include "Slic3r/Biz/UserAccount/UserAccountInteractor.hpp"
+#include "Slic3r/Domain/ConfigPhysical.hpp"
+#include <nlohmann/json.hpp>
+#include <mutex>
 #include "Slic3r/Biz/Arrange/Settings.hpp"
 #include "Slic3r/Biz/Algorithms/Scaling.hpp"
 #include "Slic3r/Domain/ModelInstance.hpp"
@@ -395,6 +402,254 @@ struct PresetsLuaApi
             }
         }
         return match->name;
+    }
+};
+
+namespace {
+std::mutex g_connect_printers_mutex;
+std::string g_connect_printers_json;   // last body from Connect's /app/printers/, raw
+bool g_connect_printers_pending{false};
+}
+
+// Printers reachable from this PrusaSlicer: saved physical printers (PrusaLink, OctoPrint, ...)
+// and the printers of the logged-in Prusa Connect account.
+struct PrintersLuaApi
+{
+    Biz::ProjectInteractor* project_interactor{nullptr};
+    ApiPermissions permissions;
+
+    struct Target
+    {
+        std::string source;   // "physical" or "connect"
+        std::string name, uuid, host, type, team_id, state, model;
+        std::optional<Biz::PhysicalPrinter::PhysicalPrinterConfig> config; // physical only
+    };
+
+    sol::table account(sol::this_state ts) const
+    {
+        sol::state_view lua(ts);
+        sol::table t = lua.create_table();
+        auto& ua = project_interactor->user_account_interactor();
+        t["logged_in"] = ua.is_logged_in();
+        t["username"]  = ua.username();
+        t["email"]     = ua.email();
+        return t;
+    }
+
+    // Asks Connect for the account's printers; list() reflects it once the answer arrived.
+    void refresh_connect() const
+    {
+        auto& ua = project_interactor->user_account_interactor();
+        if (!ua.is_logged_in()) {
+            throw Biz::Lua::LuaException("Not logged in to a Prusa account");
+        }
+        {
+            std::lock_guard<std::mutex> lock(g_connect_printers_mutex);
+            g_connect_printers_pending = true;
+        }
+        ua.request_connect_printers([](const std::string& body)
+        {
+            std::lock_guard<std::mutex> lock(g_connect_printers_mutex);
+            g_connect_printers_json    = body;
+            g_connect_printers_pending = false;
+        });
+    }
+
+    bool connect_refresh_pending() const
+    {
+        std::lock_guard<std::mutex> lock(g_connect_printers_mutex);
+        return g_connect_printers_pending;
+    }
+
+    static std::string str_field(const nlohmann::json& j, std::initializer_list<const char*> keys)
+    {
+        for (const char* k : keys) {
+            if (j.contains(k)) {
+                if (j[k].is_string()) return j[k].get<std::string>();
+                if (j[k].is_number_integer()) return std::to_string(j[k].get<long long>());
+            }
+        }
+        return {};
+    }
+
+    std::vector<Target> targets() const
+    {
+        std::vector<Target> out;
+        const auto& list = project_interactor->physical_printer_interactor().observable_list();
+        for (size_t i = 0; i < list.size(); ++i) {
+            const auto& cfg = list.at(i);
+            Target t;
+            t.source = "physical";
+            t.name   = cfg.name;
+            t.uuid   = cfg.uuid;
+            t.host   = cfg.host;
+            t.config = cfg;
+            std::visit(Domain::overloaded{
+                [&t](const Biz::PhysicalPrinter::FileSystemExport&) { t.type = "filesystem"; },
+                [&t](const Biz::PhysicalPrinter::ConnectUpload& c)
+                {
+                    t.type    = "connect";
+                    t.team_id = c.team_id;
+                    if (!c.printer_uuid.empty()) t.uuid = c.printer_uuid;
+                },
+                [&t](const Biz::PhysicalPrinter::PrinterUpload& p) { t.type = Domain::print_host_type_to_string(p.type); }
+            }, cfg.payload);
+            out.push_back(std::move(t));
+        }
+
+        std::string body;
+        {
+            std::lock_guard<std::mutex> lock(g_connect_printers_mutex);
+            body = g_connect_printers_json;
+        }
+        if (!body.empty()) {
+            try {
+                nlohmann::json j = nlohmann::json::parse(body);
+                const nlohmann::json* arr = nullptr;
+                if (j.is_array()) {
+                    arr = &j;
+                } else {
+                    for (const char* k : {"printers", "data", "items", "results"}) {
+                        if (j.contains(k) && j[k].is_array()) { arr = &j[k]; break; }
+                    }
+                }
+                if (arr != nullptr) {
+                    for (const auto& item : *arr) {
+                        if (!item.is_object()) continue;
+                        Target t;
+                        t.source  = "connect";
+                        t.type    = "connect";
+                        t.uuid    = str_field(item, {"uuid", "printer_uuid", "id"});
+                        t.name    = str_field(item, {"name", "printer_name"});
+                        t.team_id = str_field(item, {"team_id"});
+                        t.state   = str_field(item, {"printer_state", "state", "connect_state"});
+                        t.model   = str_field(item, {"printer_model", "model", "printer_type"});
+                        if (t.name.empty()) t.name = t.uuid;
+                        out.push_back(std::move(t));
+                    }
+                }
+            } catch (const std::exception& e) {
+                SPDLOG_WARN("Cannot parse Connect printers: {}", e.what());
+            }
+        }
+        return out;
+    }
+
+    sol::table list(sol::this_state ts) const
+    {
+        sol::state_view lua(ts);
+        sol::table t = lua.create_table();
+        int i = 1;
+        for (const auto& p : targets()) {
+            sol::table row = lua.create_table();
+            row["source"] = p.source;
+            row["name"]   = p.name;
+            row["uuid"]   = p.uuid;
+            row["type"]   = p.type;
+            if (!p.host.empty())    row["host"]    = p.host;
+            if (!p.team_id.empty()) row["team_id"] = p.team_id;
+            if (!p.state.empty())   row["state"]   = p.state;
+            if (!p.model.empty())   row["model"]   = p.model;
+            t[i++] = row;
+        }
+        return t;
+    }
+
+    Target find(const std::string& id_or_name) const
+    {
+        const auto all = targets();
+        auto lower = [](std::string v) { std::transform(v.begin(), v.end(), v.begin(), [](unsigned char c) { return std::tolower(c); }); return v; };
+        const std::string wanted = lower(id_or_name);
+        for (const auto& t : all) {
+            if (t.uuid == id_or_name || lower(t.name) == wanted) return t;
+        }
+        std::vector<const Target*> partial;
+        for (const auto& t : all) {
+            if (lower(t.name).find(wanted) != std::string::npos) partial.push_back(&t);
+        }
+        if (partial.size() == 1) return *partial.front();
+        if (partial.size() > 1) {
+            std::string names;
+            for (const auto* t : partial) names += (names.empty() ? "" : ", ") + t->name;
+            throw Biz::Lua::LuaException(fmt::format("'{}' is ambiguous, matches: {}", id_or_name, names));
+        }
+        throw Biz::Lua::LuaException(fmt::format("No printer named '{}'. Call list() to see the known printers, refresh_connect() to fetch the account's printers.", id_or_name));
+    }
+
+    std::string default_filename() const
+    {
+        try {
+            const auto name_data = Biz::ExportNameParser::parse_export_name(*project_interactor);
+            if (!name_data.filename.empty()) return name_data.filename;
+        } catch (const std::exception& e) {
+            SPDLOG_WARN("Cannot build the default export name: {}", e.what());
+        }
+        return "output.gcode";
+    }
+
+    // Uploads the finished slicing result to a printer. action: "upload" (just store), "queue"
+    // (send to the printer, default) or "print" (start printing / set ready).
+    std::string send(const std::string& printer, sol::optional<std::string> action_opt, sol::optional<std::string> filename_opt) const
+    {
+        if (!permissions.send_to_printer) {
+            throw Biz::Lua::LuaException("send is not permitted for installed plugins");
+        }
+        const auto slicing_id = project_interactor->selected_bed_slicing_id();
+        const auto status     = project_interactor->status_cache().get_status(slicing_id);
+        if (!status.has_value() || status->code != Biz::Slicing::StatusCode::Finished) {
+            throw Biz::Lua::LuaException("Nothing to send: slice the bed first and wait until slicing_status().finished is true");
+        }
+        const std::string action = action_opt.value_or("queue");
+        if (action != "upload" && action != "queue" && action != "print") {
+            throw Biz::Lua::LuaException("action must be upload, queue or print");
+        }
+        std::string filename = filename_opt.value_or("");
+        if (filename.empty()) filename = default_filename();
+
+        const Target target = find(printer);
+        if (target.source == "physical" && target.type == "connect" && (target.team_id.empty() || target.uuid.empty())) {
+            throw Biz::Lua::LuaException("'Prusa Connect' is the generic entry; log in, call refresh_connect() and pick one of the account's printers from list()");
+        }
+        if (target.source == "physical" && target.config.has_value()) {
+            const auto* upload = std::get_if<Biz::PhysicalPrinter::PrinterUpload>(&target.config->payload);
+            if (upload == nullptr) {
+                throw Biz::Lua::LuaException(fmt::format("'{}' is not an upload target ({})", target.name, target.type));
+            }
+            Biz::PrintHost::PrintHostAfterUploadAction post = Biz::PrintHost::PrintHostAfterUploadAction::None;
+            if (action == "print") post = Biz::PrintHost::PrintHostAfterUploadAction::StartPrint;
+            else if (action == "queue") post = Biz::PrintHost::PrintHostAfterUploadAction::QueuePrint;
+            const auto allowed = Biz::PrintHost::get_post_upload_actions(upload->type);
+            if (std::find(allowed.begin(), allowed.end(), post) == allowed.end()) {
+                post = Biz::PrintHost::PrintHostAfterUploadAction::None;
+            }
+            project_interactor->do_result_upload(slicing_id, filename, post, *target.config);
+            return fmt::format("uploading {} to {} ({}, {}){}", filename, target.name, target.type, target.host,
+                               post == Biz::PrintHost::PrintHostAfterUploadAction::None ? std::string() : ", " + action);
+        }
+
+        // Connect: same message the upload webview would send
+        auto& ua = project_interactor->user_account_interactor();
+        if (!ua.is_logged_in()) {
+            throw Biz::Lua::LuaException("Not logged in to a Prusa account");
+        }
+        if (target.team_id.empty() || target.uuid.empty()) {
+            throw Biz::Lua::LuaException(fmt::format("Connect printer '{}' has no team id or uuid", target.name));
+        }
+        nlohmann::json data;
+        data["filename"] = filename;
+        data["team_id"]  = target.team_id;
+        if (action != "upload") {
+            data["printer_uuid"] = target.uuid;
+            data["set_ready"]    = (action == "print");
+        }
+        nlohmann::json msg;
+        msg["action"]       = action == "print" ? "PRINT" : (action == "queue" ? "QUEUE" : "UPLOAD");
+        msg["filename"]     = filename;
+        msg["team_id"]      = target.team_id;
+        msg["printer_uuid"] = target.uuid;
+        msg["data"]         = data;
+        project_interactor->do_result_upload_connect(slicing_id, msg.dump(), filename);
+        return fmt::format("uploading {} to Connect printer {} ({})", filename, target.name, action);
     }
 };
 
@@ -1747,6 +2002,43 @@ void ProjectApi::register_api(Biz::Lua::LuaEngine& lua)
     //--@type PresetsApi
     //- api.presets = {}
     api["presets"] = PresetsLuaApi{&m_project_interactor};
+
+    //--@class PrintersApi
+    //- local PrintersApi = {}
+
+    //-- Prusa account state: logged_in, username, email.
+    //--@return table
+    //- function PrintersApi:account() end
+
+    //-- Asks Prusa Connect for the account's printers in the background; list() shows them once fetched.
+    //- function PrintersApi:refresh_connect() end
+
+    //-- True while a refresh_connect() request is still running.
+    //--@return boolean
+    //- function PrintersApi:connect_refresh_pending() end
+
+    //-- Known printers: saved physical printers and fetched Connect printers.
+    //--@return table[] printers Each with source, name, uuid, type and, when known, host, team_id, state, model.
+    //- function PrintersApi:list() end
+
+    //-- Uploads the finished slicing result to a printer by name or uuid.
+    //-- Only available to scripts run through the plugin server.
+    //--@param printer string
+    //--@param action? string "upload", "queue" (default) or "print"
+    //--@param filename? string Defaults to the configured output name.
+    //--@return string message
+    //- function PrintersApi:send(printer, action, filename) end
+    state.new_usertype<PrintersLuaApi>("PrintersApi",
+        sol::no_constructor,
+        "account", &PrintersLuaApi::account,
+        "refresh_connect", &PrintersLuaApi::refresh_connect,
+        "connect_refresh_pending", &PrintersLuaApi::connect_refresh_pending,
+        "list", &PrintersLuaApi::list,
+        "send", &PrintersLuaApi::send
+    );
+    //--@type PrintersApi
+    //- api.printers = {}
+    api["printers"] = PrintersLuaApi{&m_project_interactor, m_permissions};
     //-- Creates a cube mesh.
     //--@param width number Width [mm]
     //--@param height number Height [mm]

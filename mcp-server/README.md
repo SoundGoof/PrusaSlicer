@@ -42,6 +42,11 @@ Or with curl:
 - import: `import_models` (STL, 3MF, OBJ, ... like File > Import)
 - dialogs: `list_dialogs`, `close_dialog`, `close_all_dialogs`,
   `discard_crashed_projects` (dismisses the project recovery pane)
+- printers: `account`, `list_printers`, `send_to_printer` (PrusaLink/OctoPrint
+  printers saved as physical printers, or the logged-in Prusa Connect
+  account's printers; actions upload, queue, print). The Connect path
+  builds the same message as the upload web view; it has not yet been
+  exercised against a live account, so verify with `upload` first.
 - `run_lua` for anything else, `ping`
 
 It needs the `mcp` package (Fedora: `python3-mcp`). Register it in Claude Code with:

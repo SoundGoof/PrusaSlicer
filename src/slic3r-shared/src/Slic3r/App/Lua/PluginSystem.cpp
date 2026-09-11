@@ -205,7 +205,7 @@ PluginSystem::ExecutionResult PluginSystem::execute_source(const std::string& so
 {
     ExecutionResult result;
 
-    ProjectApi project_api(m_project_interactor, m_font_manager, ProjectApi::Permissions{.export_files = true, .import_files = true}, m_ui_host);
+    ProjectApi project_api(m_project_interactor, m_font_manager, ProjectApi::Permissions{.export_files = true, .import_files = true, .send_to_printer = true}, m_ui_host);
     Biz::Lua::LuaEngine lua;
     lua.open_registry([&project_api](auto& lua) { project_api.register_api(lua); });
     PackageRegistry package_registry;

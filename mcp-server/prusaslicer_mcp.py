@@ -373,6 +373,44 @@ print("sheet:    " .. api.presets:selected("sheet"))
     )
 
 
+# ---------------------------------------------------------------- printers
+
+@mcp.tool()
+def account() -> str:
+    """Show whether PrusaSlicer is logged in to a Prusa account, and as whom."""
+    return json.dumps(_run_json("return _json(api.printers:account())"))
+
+
+@mcp.tool()
+def list_printers(refresh: bool = True, wait_s: float = 4.0) -> str:
+    """List printers you can send to: saved physical printers (PrusaLink, OctoPrint, ...) and, when
+    logged in, the Prusa Connect printers of the account. refresh=True fetches the Connect list first."""
+    acct = _run_json("return _json(api.printers:account())")
+    if refresh and acct.get("logged_in"):
+        _run("api.printers:refresh_connect()")
+        deadline = time.monotonic() + wait_s
+        while time.monotonic() < deadline:
+            time.sleep(0.3)
+            if not _run_json("return _json({p = api.printers:connect_refresh_pending()})").get("p"):
+                break
+    rows = _run_json("return _json(api.printers:list())")
+    if not rows:
+        return "no printers known" + ("" if acct.get("logged_in") else " (not logged in to a Prusa account; add a physical printer or log in)")
+    lines = []
+    for r in rows:
+        extra = ", ".join(f"{k}={r[k]}" for k in ("host", "state", "model", "team_id") if r.get(k))
+        lines.append(f"[{r['source']}] {r['name']}  type={r['type']}  uuid={r.get('uuid','')}" + (f"  {extra}" if extra else ""))
+    return "\n".join(lines)
+
+
+@mcp.tool()
+def send_to_printer(printer: str, action: str = "queue", filename: str = "") -> str:
+    """Upload the sliced G-code to a printer by name or uuid (see list_printers). action: "upload" just
+    stores the file, "queue" (default) sends it to the printer, "print" starts printing. Slice first."""
+    args = _lua_string(printer) + ", " + _lua_string(action) + (", " + _lua_string(filename) if filename else "")
+    return _run(f"return api.printers:send({args})")
+
+
 # ---------------------------------------------------------------- dialogs
 
 @mcp.tool()
