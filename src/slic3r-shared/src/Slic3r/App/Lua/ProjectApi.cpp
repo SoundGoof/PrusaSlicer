@@ -12,6 +12,9 @@
 #include "Slic3r/Biz/Format/STL.hpp"
 #include "Slic3r/Biz/Lua/LuaException.hpp"
 #include "Slic3r/Biz/ResultExport/ExportNameParser.hpp"
+#include "Slic3r/Biz/ArrangeInteractor.hpp"
+#include "Slic3r/Biz/Arrange/Settings.hpp"
+#include "Slic3r/Biz/Algorithms/Scaling.hpp"
 #include "Slic3r/Domain/ModelInstance.hpp"
 #include "Slic3r/Domain/ModelObject.hpp"
 #include "Slic3r/Domain/Project.hpp"
@@ -130,6 +133,13 @@ struct ModelElement
         return {Biz::Algorithms::ModelObject::instance_bounding_box(object(), instance())};
     }
 
+    // Center of the instance's bounding box in world space (what a user calls "where it is").
+    Vec3 center() const
+    {
+        const auto bb = Biz::Algorithms::ModelObject::instance_bounding_box(object(), instance());
+        return Vec3::from((bb.min + bb.max) / 2.0);
+    }
+
     // ---- write access, all changes go through the scene interactor so the scene and undo stay consistent
 
     Biz::Scene::SceneInteractor& scene() const
@@ -163,10 +173,24 @@ struct ModelElement
         translate(x - p.x(), y - p.y(), z - p.z());
     }
 
-    // Rotation around the instance origin, world axes, radians.
+    // Moves the instance so the center of its footprint is at (x, y); keeps it on the bed surface.
+    void set_center(double x, double y) const
+    {
+        const Vec3 c = center();
+        translate(x - c.x, y - c.y, 0.0);
+    }
+
+    // Pivot for rotation and scaling: the center of the footprint, on the bed surface.
+    Domain::Vec3d pivot() const
+    {
+        const auto bb = Biz::Algorithms::ModelObject::instance_bounding_box(object(), instance());
+        return {(bb.min.x() + bb.max.x()) / 2.0, (bb.min.y() + bb.max.y()) / 2.0, bb.min.z()};
+    }
+
+    // Rotation around the footprint center, world axes, radians.
     void rotate(double rx, double ry, double rz) const
     {
-        const Domain::Vec3d o = instance().get_offset();
+        const Domain::Vec3d o = pivot();
         Domain::Transform3d r = Domain::Transform3d::Identity();
         r.rotate(
             Eigen::AngleAxisd(rz, Domain::Vec3d::UnitZ()) *
@@ -176,10 +200,10 @@ struct ModelElement
         apply_world_transform(Domain::Transform3d{Eigen::Translation3d(o) * r * Eigen::Translation3d(-o)});
     }
 
-    // Scaling around the instance origin, world axes.
+    // Scaling around the footprint center, keeping the part on the bed surface.
     void scale_by(double sx, double sy, double sz) const
     {
-        const Domain::Vec3d o = instance().get_offset();
+        const Domain::Vec3d o = pivot();
         Domain::Transform3d sc = Domain::Transform3d::Identity();
         sc.scale(Domain::Vec3d(sx, sy, sz));
         apply_world_transform(Domain::Transform3d{Eigen::Translation3d(o) * sc * Eigen::Translation3d(-o)});
@@ -201,12 +225,35 @@ struct ModelElement
         scene().set_printable(instance_ref(), is_printable);
     }
 
-    // Removes the whole model object, including all of its instances.
+    Biz::Scene::ObjectSelection object_selection() const
+    {
+        Biz::Scene::ObjectSelection sel;
+        sel.mode = Biz::Scene::SelectionMode::Instance;
+        for (const auto* inst : object().instances) {
+            sel.elements.emplace_back(ref.object_id, inst->id().id);
+        }
+        return sel;
+    }
+
+    // Selects this instance in the scene (or the whole object when the element has no instance).
+    void select() const
+    {
+        Biz::Scene::ObjectSelection sel;
+        sel.mode = Biz::Scene::SelectionMode::Instance;
+        if (ref.has_instance()) {
+            sel.elements.emplace_back(ref.object_id, ref.instance_id);
+        } else {
+            sel = object_selection();
+        }
+        scene().set_object_selection(sel);
+    }
+
+    // Removes the whole model object, including all of its instances, the same way the Delete key does.
     bool remove_object() const
     {
-        object(); // validates the binding
-        auto* obj = project_interactor->project(project_id).find_object_by_id(ref.object_id);
-        return obj != nullptr && scene().delete_object(obj);
+        scene().set_object_selection(object_selection());
+        scene().delete_selected_elements();
+        return true;
     }
 };
 
@@ -740,6 +787,65 @@ struct ProjectLuaApi
 
     // ---- slicing and export of the selected bed
 
+    void clear_selection() { project_interactor.scene_interactor().clear_object_selection(); }
+
+    const Domain::BedInstance& selected_bed_instance() const
+    {
+        const auto& bed_sel = project_interactor.scene_interactor().bed_selection();
+        if (bed_sel.empty()) {
+            throw Biz::Lua::LuaException("No bed is selected");
+        }
+        const auto* bed_inst = project_interactor.project(project_id).find_bed_instance_by_id(bed_sel.last_selected_bed().instance_id);
+        if (bed_inst == nullptr) {
+            throw Biz::Lua::LuaException("Selected bed not found");
+        }
+        return *bed_inst;
+    }
+
+    // Printable area of the selected bed in world coordinates.
+    sol::table bed_bounds(sol::this_state ts) const
+    {
+        sol::state_view lua(ts);
+        const auto& inst   = selected_bed_instance();
+        const auto& aabb   = inst.bed.get().contour_aabb();
+        const auto offset  = inst.transformation.get_offset();
+        sol::table t = lua.create_table();
+        t["min_x"]  = aabb.min.x() + offset.x();
+        t["min_y"]  = aabb.min.y() + offset.y();
+        t["max_x"]  = aabb.max.x() + offset.x();
+        t["max_y"]  = aabb.max.y() + offset.y();
+        t["height"] = static_cast<double>(inst.bed.get().max_print_height());
+        return t;
+    }
+
+    // Arranges every printable instance of the selected config container, like the Arrange button.
+    void arrange()
+    {
+        const auto& cc = project_interactor.selected_config_container();
+        Domain::ConstModelInstanceList instances;
+        std::vector<Biz::BedToArrange> beds;
+        for (const auto& bed_instance : cc.bed_instances()) {
+            for (const Domain::ModelInstance* mi : bed_instance->model_instances) {
+                if (mi->printable) {
+                    instances.push_back(mi);
+                }
+            }
+            beds.push_back({Domain::BedRef{cc.id().id, bed_instance->id().id}, bed_instance->index()});
+        }
+        for (const Domain::ModelInstance* mi : project_interactor.scene_interactor().unplaced_model_instances(project_id)) {
+            if (mi->printable) {
+                instances.push_back(mi);
+            }
+        }
+        Biz::Arrange::Settings settings;
+        settings.scaled_offset = Biz::Algorithms::Scaling::scaled(3.0);
+        auto* pi = &project_interactor;
+        project_interactor.arrange_interactor().arrange(
+            project_id, beds, cc.id().id, instances, settings,
+            [pi]() { pi->undo_provider().take_snapshot(Biz::UndoSnapshotType::Arrange); }
+        );
+    }
+
     void slice()
     {
         project_interactor.slicing_interactor().slice_bed(project_interactor.selected_bed_slicing_id());
@@ -1265,6 +1371,15 @@ void ProjectApi::register_api(Biz::Lua::LuaEngine& lua)
     //--@return BoundingBox
     //- function ModelElement:bounds() end
 
+    //-- Center of the instance's bounding box in world space.
+    //--@return Vec3
+    //- function ModelElement:center() end
+
+    //-- Moves the instance so the center of its footprint is at (x, y) [mm].
+    //--@param x number
+    //--@param y number
+    //- function ModelElement:set_center(x, y) end
+
     //-- Moves the instance by the given offsets [mm].
     //--@param dx number
     //--@param dy number
@@ -1277,13 +1392,13 @@ void ProjectApi::register_api(Biz::Lua::LuaEngine& lua)
     //--@param z number
     //- function ModelElement:set_position(x, y, z) end
 
-    //-- Rotates the instance around its origin, world axes [rad].
+    //-- Rotates the instance around the center of its footprint, world axes [rad].
     //--@param rx number
     //--@param ry number
     //--@param rz number
     //- function ModelElement:rotate(rx, ry, rz) end
 
-    //-- Scales the instance around its origin by the given factors.
+    //-- Scales the instance around the center of its footprint, keeping it on the bed.
     //--@param sx number
     //--@param sy number
     //--@param sz number
@@ -1303,6 +1418,9 @@ void ProjectApi::register_api(Biz::Lua::LuaEngine& lua)
     //--@param printable boolean
     //- function ModelElement:set_printable(printable) end
 
+    //-- Selects this instance in the scene.
+    //- function ModelElement:select() end
+
     //-- Removes the whole model object with all its instances.
     //--@return boolean removed
     //- function ModelElement:remove_object() end
@@ -1316,6 +1434,8 @@ void ProjectApi::register_api(Biz::Lua::LuaEngine& lua)
         "rotation", &ModelElement::rotation,
         "scale", &ModelElement::scale,
         "bounds", &ModelElement::bounds,
+        "center", &ModelElement::center,
+        "set_center", &ModelElement::set_center,
         "translate", &ModelElement::translate,
         "set_position", &ModelElement::set_position,
         "rotate", &ModelElement::rotate,
@@ -1323,6 +1443,7 @@ void ProjectApi::register_api(Biz::Lua::LuaEngine& lua)
         "set_scale", &ModelElement::set_scale,
         "set_name", &ModelElement::set_name,
         "set_printable", &ModelElement::set_printable,
+        "select", &ModelElement::select,
         "remove_object", &ModelElement::remove_object
     );
 
@@ -1515,6 +1636,16 @@ void ProjectApi::register_api(Biz::Lua::LuaEngine& lua)
     //--@return ModelElement[] added The newly added instances.
     //- function ProjectApi:import_models(paths) end
 
+    //-- Deselects everything in the scene.
+    //- function ProjectApi:clear_selection() end
+
+    //-- Printable area of the selected bed in world coordinates.
+    //--@return table bounds Fields min_x, min_y, max_x, max_y, height.
+    //- function ProjectApi:bed_bounds() end
+
+    //-- Arranges all printable objects on the beds of the selected printer, like the Arrange button. Runs in the background.
+    //- function ProjectApi:arrange() end
+
     //-- Starts slicing the selected bed in the background. Poll slicing_status() for the result.
     //- function ProjectApi:slice() end
 
@@ -1532,6 +1663,9 @@ void ProjectApi::register_api(Biz::Lua::LuaEngine& lua)
         "add_object", &ProjectLuaApi::add_object,
         "objects", &ProjectLuaApi::objects,
         "import_models", &ProjectLuaApi::import_models,
+        "clear_selection", &ProjectLuaApi::clear_selection,
+        "bed_bounds", &ProjectLuaApi::bed_bounds,
+        "arrange", &ProjectLuaApi::arrange,
         "slice", &ProjectLuaApi::slice,
         "slicing_status", &ProjectLuaApi::slicing_status,
         "export_gcode", &ProjectLuaApi::export_gcode,

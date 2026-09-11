@@ -131,14 +131,27 @@ def list_objects() -> str:
 local els = api.project:objects()
 if #els == 0 then print("no objects in project") end
 for i, el in ipairs(els) do
-    local p, r, s, b = el:position(), el:rotation(), el:scale(), el:bounds()
+    local c, r, s, b = el:center(), el:rotation(), el:scale(), el:bounds()
     print(string.format("#%d %s object=%d instance=%d printable=%s", i, el.name, el.object_id, el.instance_id, tostring(el.printable)))
-    print(string.format("   pos=(%.2f, %.2f, %.2f) rot_deg=(%.1f, %.1f, %.1f) scale=(%.3f, %.3f, %.3f)",
-        p.x, p.y, p.z, math.deg(r.x), math.deg(r.y), math.deg(r.z), s.x, s.y, s.z))
+    print(string.format("   center=(%.1f, %.1f) size=(%.1f x %.1f x %.1f) rot_deg=(%.1f, %.1f, %.1f) scale=(%.3f, %.3f, %.3f)",
+        c.x, c.y, b.max_x - b.min_x, b.max_y - b.min_y, b.max_z - b.min_z, math.deg(r.x), math.deg(r.y), math.deg(r.z), s.x, s.y, s.z))
     print(string.format("   bounds=(%.2f, %.2f, %.2f)-(%.2f, %.2f, %.2f)", b.min_x, b.min_y, b.min_z, b.max_x, b.max_y, b.max_z))
 end
 """
     )
+
+
+_BED_CHECK = """
+do
+    local bed, b = api.project:bed_bounds(), target:bounds()
+    if b.min_x < bed.min_x - 0.01 or b.min_y < bed.min_y - 0.01 or b.max_x > bed.max_x + 0.01 or b.max_y > bed.max_y + 0.01 then
+        print(string.format("WARNING: %s is outside the bed (bed x %.0f..%.0f, y %.0f..%.0f; object x %.1f..%.1f, y %.1f..%.1f)",
+            target.name, bed.min_x, bed.max_x, bed.min_y, bed.max_y, b.min_x, b.max_x, b.min_y, b.max_y))
+    elseif bed.height > 0 and b.max_z > bed.height + 0.01 then
+        print(string.format("WARNING: %s is taller than the printer allows (%.1f > %.1f mm)", target.name, b.max_z, bed.height))
+    end
+end
+"""
 
 
 def _select(object_id: int, instance_id: int | None) -> str:
@@ -157,25 +170,32 @@ if not target then error("no such object/instance") end
 @mcp.tool()
 def move_object(object_id: int, dx: float = 0, dy: float = 0, dz: float = 0, instance_id: int | None = None) -> str:
     """Move an object instance by dx, dy, dz millimetres. Use list_objects to find ids."""
-    return _run(_select(object_id, instance_id) + f"target:translate({dx}, {dy}, {dz})\nlocal p = target:position()\nprint(string.format('%s now at (%.2f, %.2f, %.2f)', target.name, p.x, p.y, p.z))")
+    return _run(_select(object_id, instance_id) + f"target:translate({dx}, {dy}, {dz})\nlocal p = target:position()\nprint(string.format('%s now at (%.2f, %.2f, %.2f)', target.name, p.x, p.y, p.z))" + _BED_CHECK)
+
+
+@mcp.tool()
+def place_object(object_id: int, x: float, y: float, instance_id: int | None = None) -> str:
+    """Place an object so the center of its footprint is at bed coordinates x, y (millimetres).
+    Use bed_bounds to see the printable area. This is what "put it at 100, 100" means to a user."""
+    return _run(_select(object_id, instance_id) + f"target:set_center({x}, {y})\nlocal c = target:center()\nprint(string.format('%s centered at (%.1f, %.1f)', target.name, c.x, c.y))" + _BED_CHECK)
 
 
 @mcp.tool()
 def set_position(object_id: int, x: float, y: float, z: float = 0, instance_id: int | None = None) -> str:
-    """Place an object instance so its origin is at world position x, y, z millimetres."""
-    return _run(_select(object_id, instance_id) + f"target:set_position({x}, {y}, {z})\nprint('ok')")
+    """Set the instance origin to x, y, z. The origin is usually not the visual center; prefer place_object."""
+    return _run(_select(object_id, instance_id) + f"target:set_position({x}, {y}, {z})\nprint('ok')" + _BED_CHECK)
 
 
 @mcp.tool()
 def rotate_object(object_id: int, rx_deg: float = 0, ry_deg: float = 0, rz_deg: float = 0, instance_id: int | None = None) -> str:
     """Rotate an object instance around its origin by the given angles in degrees (world axes)."""
-    return _run(_select(object_id, instance_id) + f"target:rotate(math.rad({rx_deg}), math.rad({ry_deg}), math.rad({rz_deg}))\nprint('ok')")
+    return _run(_select(object_id, instance_id) + f"target:rotate(math.rad({rx_deg}), math.rad({ry_deg}), math.rad({rz_deg}))\nprint('ok')" + _BED_CHECK)
 
 
 @mcp.tool()
 def scale_object(object_id: int, factor: float, instance_id: int | None = None) -> str:
     """Scale an object instance uniformly by the given factor (2 doubles the size)."""
-    return _run(_select(object_id, instance_id) + f"target:scale_by({factor}, {factor}, {factor})\nprint('ok')")
+    return _run(_select(object_id, instance_id) + f"target:scale_by({factor}, {factor}, {factor})\nprint('ok')" + _BED_CHECK)
 
 
 @mcp.tool()
@@ -185,9 +205,32 @@ def rename_object(object_id: int, name: str) -> str:
 
 
 @mcp.tool()
+def select_object(object_id: int | None = None, instance_id: int | None = None) -> str:
+    """Highlight an object in the 3D view, or clear the selection when no id is given."""
+    if object_id is None:
+        return _run("api.project:clear_selection()\nprint('selection cleared')")
+    return _run(_select(object_id, instance_id) + "target:select()\nprint('selected ' .. target.name)")
+
+
+@mcp.tool()
 def remove_object(object_id: int) -> str:
     """Remove a model object and all of its instances from the plate."""
     return _run(_select(object_id, None) + "target:remove_object()\nprint('removed')")
+
+
+@mcp.tool()
+def bed_bounds() -> str:
+    """Printable area of the selected bed in world millimetres, and the maximum print height."""
+    return json.dumps(_run_json("return _json(api.project:bed_bounds())"))
+
+
+@mcp.tool()
+def arrange(wait_s: float = 3.0) -> str:
+    """Auto-arrange all printable objects on the bed, like the Arrange button. Runs in the background;
+    waits wait_s seconds and then reports the resulting positions."""
+    _run("api.project:arrange()")
+    time.sleep(wait_s)
+    return list_objects()
 
 
 @mcp.tool()

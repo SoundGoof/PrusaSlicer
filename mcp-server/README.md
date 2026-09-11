@@ -29,8 +29,10 @@ Or with curl:
 
 `prusaslicer_mcp.py` exposes the API as MCP tools:
 
-- objects: `list_objects`, `move_object`, `set_position`, `rotate_object`,
-  `scale_object`, `rename_object`, `remove_object`, `add_cube`
+- objects: `list_objects`, `place_object` (by footprint center), `move_object`,
+  `rotate_object`, `scale_object`, `rename_object`, `select_object`,
+  `remove_object`, `add_cube`, `bed_bounds`, `arrange`. Moves, rotations and
+  scaling warn when the result lies outside the bed or above the print height.
 - slicing: `slice` (waits by default), `slicing_status`, `export_gcode`
   (file or directory, waits for the file)
 - settings: `get_setting`, `set_setting`, `list_settings` with scope
