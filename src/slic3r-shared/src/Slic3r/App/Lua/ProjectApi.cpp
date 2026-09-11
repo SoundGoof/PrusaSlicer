@@ -11,6 +11,9 @@
 #include "Slic3r/Biz/Emboss/TextShapeProvider.hpp"
 #include "Slic3r/Biz/Format/STL.hpp"
 #include "Slic3r/Biz/Lua/LuaException.hpp"
+#include "Slic3r/Domain/ModelInstance.hpp"
+#include "Slic3r/Domain/ModelObject.hpp"
+#include "Slic3r/Domain/Project.hpp"
 
 #include <fmt/ranges.h>
 
@@ -52,10 +55,18 @@ enum class ElementType
     Object, Volume, Instance
 };
 
+struct Vec3
+{
+    double x{0.0}, y{0.0}, z{0.0};
+
+    static Vec3 from(const Domain::Vec3d& v) { return {v.x(), v.y(), v.z()}; }
+};
+
 struct ModelElement
 {
     size_t project_id;
     Domain::ElementRef ref;
+    Biz::ProjectInteractor* project_interactor{nullptr};
 
     ElementType type() const
     {
@@ -66,6 +77,130 @@ struct ModelElement
             return ElementType::Instance;
         }
         return ElementType::Object;
+    }
+
+    size_t object_id() const { return ref.object_id; }
+    size_t instance_id() const { return ref.instance_id; }
+
+    const Domain::ModelObject& object() const
+    {
+        if (project_interactor == nullptr) {
+            throw Biz::Lua::LuaException("Model element is not bound to a project");
+        }
+        const auto* obj = project_interactor->project(project_id).find_object_by_id(ref.object_id);
+        if (obj == nullptr) {
+            throw Biz::Lua::LuaException(fmt::format("Model object {} no longer exists", ref.object_id));
+        }
+        return *obj;
+    }
+
+    // The instance this element refers to, or the first instance of the object.
+    const Domain::ModelInstance& instance() const
+    {
+        const auto& obj = object();
+        if (ref.has_instance()) {
+            for (const auto* inst : obj.instances) {
+                if (inst->id().id == ref.instance_id) {
+                    return *inst;
+                }
+            }
+            throw Biz::Lua::LuaException(fmt::format("Model instance {} no longer exists", ref.instance_id));
+        }
+        if (obj.instances.empty()) {
+            throw Biz::Lua::LuaException(fmt::format("Model object {} has no instances", ref.object_id));
+        }
+        return *obj.instances.front();
+    }
+
+    std::string name() const { return object().name; }
+    bool printable() const { return instance().printable; }
+    Vec3 position() const { return Vec3::from(instance().get_offset()); }
+    Vec3 rotation() const { return Vec3::from(instance().get_rotation()); }
+    Vec3 scale() const { return Vec3::from(instance().get_scaling_factor()); }
+
+    // World space bounding box of the instance.
+    BoundingBox bounds() const
+    {
+        return {Biz::Algorithms::ModelObject::instance_bounding_box(object(), instance())};
+    }
+
+    // ---- write access, all changes go through the scene interactor so the scene and undo stay consistent
+
+    Biz::Scene::SceneInteractor& scene() const
+    {
+        object(); // validates the binding
+        return project_interactor->scene_interactor();
+    }
+
+    // Reference that always carries a valid instance id.
+    Domain::ElementRef instance_ref() const
+    {
+        return Domain::ElementRef{ref.object_id, ref.has_instance() ? ref.instance_id : instance().id().id};
+    }
+
+    // new_matrix = relative (world space) * current_matrix
+    void apply_world_transform(const Domain::Transform3d& relative) const
+    {
+        Biz::Scene::SceneInteractor::ElementTransforms transforms;
+        transforms[instance_ref()] = (relative * instance().get_matrix()).matrix();
+        scene().set_element_transforms(transforms);
+    }
+
+    void translate(double dx, double dy, double dz) const
+    {
+        apply_world_transform(Domain::Transform3d{Eigen::Translation3d(dx, dy, dz)});
+    }
+
+    void set_position(double x, double y, double z) const
+    {
+        const Domain::Vec3d p = instance().get_offset();
+        translate(x - p.x(), y - p.y(), z - p.z());
+    }
+
+    // Rotation around the instance origin, world axes, radians.
+    void rotate(double rx, double ry, double rz) const
+    {
+        const Domain::Vec3d o = instance().get_offset();
+        Domain::Transform3d r = Domain::Transform3d::Identity();
+        r.rotate(
+            Eigen::AngleAxisd(rz, Domain::Vec3d::UnitZ()) *
+            Eigen::AngleAxisd(ry, Domain::Vec3d::UnitY()) *
+            Eigen::AngleAxisd(rx, Domain::Vec3d::UnitX())
+        );
+        apply_world_transform(Domain::Transform3d{Eigen::Translation3d(o) * r * Eigen::Translation3d(-o)});
+    }
+
+    // Scaling around the instance origin, world axes.
+    void scale_by(double sx, double sy, double sz) const
+    {
+        const Domain::Vec3d o = instance().get_offset();
+        Domain::Transform3d sc = Domain::Transform3d::Identity();
+        sc.scale(Domain::Vec3d(sx, sy, sz));
+        apply_world_transform(Domain::Transform3d{Eigen::Translation3d(o) * sc * Eigen::Translation3d(-o)});
+    }
+
+    void set_scale(double sx, double sy, double sz) const
+    {
+        const Domain::Vec3d s = instance().get_scaling_factor();
+        scale_by(sx / s.x(), sy / s.y(), sz / s.z());
+    }
+
+    void set_name(const std::string& new_name) const
+    {
+        scene().edit_name(Domain::ElementRef{ref.object_id}, new_name);
+    }
+
+    void set_printable(bool is_printable) const
+    {
+        scene().set_printable(instance_ref(), is_printable);
+    }
+
+    // Removes the whole model object, including all of its instances.
+    bool remove_object() const
+    {
+        object(); // validates the binding
+        auto* obj = project_interactor->project(project_id).find_object_by_id(ref.object_id);
+        return obj != nullptr && scene().delete_object(obj);
     }
 };
 
@@ -355,7 +490,20 @@ struct ProjectLuaApi
         scene_interactor.new_object_from_mesh(std::move(mesh_copy), project_id, update_fn);
         const auto& sel = scene_interactor.object_selection(project_id);
 
-        return {project_id, sel.elements.front()};
+        return {project_id, sel.elements.front(), &project_interactor};
+    }
+
+    // One element per model instance currently in the project.
+    sol::as_table_t<std::vector<ModelElement>> objects() const
+    {
+        std::vector<ModelElement> result;
+        const auto& model = project_interactor.project(project_id).model();
+        for (const auto* obj : model.objects) {
+            for (const auto* inst : obj->instances) {
+                result.push_back({project_id, Domain::ElementRef{obj->id().id, inst->id().id}, &project_interactor});
+            }
+        }
+        return sol::as_table(std::move(result));
     }
 
     ModelElement add_volume(const ModelElement& target, Domain::ModelVolumeType vol_type, const Mesh& mesh)
@@ -371,7 +519,7 @@ struct ProjectLuaApi
             added_vol_ref.volume_id = added_vol->id().id;
             return added_vol;
         });
-        return {project_id, added_vol_ref};
+        return {project_id, added_vol_ref, &project_interactor};
     }
 
     void clear_layer_custom_steps(const BedInstRef& bed_inst_ref)
@@ -685,10 +833,101 @@ void ProjectApi::register_api(Biz::Lua::LuaEngine& lua)
     //- function Mesh:bounds() end
     state.new_usertype<Mesh>("Mesh", sol::no_constructor, "translate", &Mesh::translate, "bounds", &Mesh::bounds);
 
+    //--@class Vec3
+    //--@field x number
+    //--@field y number
+    //--@field z number
+    //- local Vec3 = {}
+    state.new_usertype<Vec3>("Vec3", sol::no_constructor,
+        "x", sol::readonly(&Vec3::x),
+        "y", sol::readonly(&Vec3::y),
+        "z", sol::readonly(&Vec3::z)
+    );
+
     //--@class ModelElement
     //--@field type integer The element type identifier.
+    //--@field object_id integer Id of the model object.
+    //--@field instance_id integer Id of the model instance (0 if the element refers to the whole object).
+    //--@field name string Name of the model object.
+    //--@field printable boolean Whether the instance is printable.
     //- local ModelElement = {}
-    state.new_usertype<ModelElement>("ModelElement", sol::no_constructor, "type", sol::property(&ModelElement::type));
+
+    //-- Position of the instance in world space [mm].
+    //--@return Vec3
+    //- function ModelElement:position() end
+
+    //-- Rotation of the instance around X, Y, Z [rad].
+    //--@return Vec3
+    //- function ModelElement:rotation() end
+
+    //-- Scaling factors of the instance.
+    //--@return Vec3
+    //- function ModelElement:scale() end
+
+    //-- World space bounding box of the instance.
+    //--@return BoundingBox
+    //- function ModelElement:bounds() end
+
+    //-- Moves the instance by the given offsets [mm].
+    //--@param dx number
+    //--@param dy number
+    //--@param dz number
+    //- function ModelElement:translate(dx, dy, dz) end
+
+    //-- Moves the instance so its origin is at the given world position [mm].
+    //--@param x number
+    //--@param y number
+    //--@param z number
+    //- function ModelElement:set_position(x, y, z) end
+
+    //-- Rotates the instance around its origin, world axes [rad].
+    //--@param rx number
+    //--@param ry number
+    //--@param rz number
+    //- function ModelElement:rotate(rx, ry, rz) end
+
+    //-- Scales the instance around its origin by the given factors.
+    //--@param sx number
+    //--@param sy number
+    //--@param sz number
+    //- function ModelElement:scale_by(sx, sy, sz) end
+
+    //-- Sets the absolute scaling factors of the instance.
+    //--@param sx number
+    //--@param sy number
+    //--@param sz number
+    //- function ModelElement:set_scale(sx, sy, sz) end
+
+    //-- Renames the model object.
+    //--@param name string
+    //- function ModelElement:set_name(name) end
+
+    //-- Sets whether the instance is printable.
+    //--@param printable boolean
+    //- function ModelElement:set_printable(printable) end
+
+    //-- Removes the whole model object with all its instances.
+    //--@return boolean removed
+    //- function ModelElement:remove_object() end
+    state.new_usertype<ModelElement>("ModelElement", sol::no_constructor,
+        "type", sol::property(&ModelElement::type),
+        "object_id", sol::property(&ModelElement::object_id),
+        "instance_id", sol::property(&ModelElement::instance_id),
+        "name", sol::property(&ModelElement::name),
+        "printable", sol::property(&ModelElement::printable),
+        "position", &ModelElement::position,
+        "rotation", &ModelElement::rotation,
+        "scale", &ModelElement::scale,
+        "bounds", &ModelElement::bounds,
+        "translate", &ModelElement::translate,
+        "set_position", &ModelElement::set_position,
+        "rotate", &ModelElement::rotate,
+        "scale_by", &ModelElement::scale_by,
+        "set_scale", &ModelElement::set_scale,
+        "set_name", &ModelElement::set_name,
+        "set_printable", &ModelElement::set_printable,
+        "remove_object", &ModelElement::remove_object
+    );
 
     //--@class ConfigBox
     //- local ConfigBox = {}
@@ -863,9 +1102,14 @@ void ProjectApi::register_api(Biz::Lua::LuaEngine& lua)
     //-- Retrieves the currently active bed instance.
     //--@return BedInstRef
     //- function ProjectApi:current_bed() end
+
+    //-- Lists the model instances currently in the project, one element per instance.
+    //--@return ModelElement[]
+    //- function ProjectApi:objects() end
     state.new_usertype<ProjectLuaApi>("ProjectApi",
         sol::no_constructor,
         "add_object", &ProjectLuaApi::add_object,
+        "objects", &ProjectLuaApi::objects,
         "insert_layer_custom_gcode", &ProjectLuaApi::insert_layer_custom_gcode,
         "clear_layer_custom_steps", &ProjectLuaApi::clear_layer_custom_steps,
         "current_bed", &ProjectLuaApi::current_bed

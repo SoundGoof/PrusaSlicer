@@ -1,0 +1,12 @@
+{
+	"id": "com.soundgoof.scene",
+	"name": "Scene inspector",
+	"version": "0.1.0",
+	"min_slicer_version": "3.0.0",
+	"author": "soundgoof",
+	"description": "Development plugins for the scene read/write Lua API",
+	"license": "AGPL-3.0-only",
+	"required_apis": {
+		"project.plugin": "1.0.0"
+	}
+}
