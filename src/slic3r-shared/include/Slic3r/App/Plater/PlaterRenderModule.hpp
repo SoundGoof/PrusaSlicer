@@ -89,7 +89,8 @@ class PlaterRenderModule final :
     public Biz::ISelectedProjectChangedListener,
     public Biz::Preset::IPresetChangedListener,
     public Scene::ISharedModelGeometryProvider,
-    public IShowContextMenuListener
+    public IShowContextMenuListener,
+    public Lua::IPluginUiHost
 {
 public:
     PlaterRenderModule(
@@ -127,6 +128,16 @@ public:
 
     void set_opened_dialog(Yoga::Dialog* opened_dialog);
     void open_invalid_data_dialog();
+
+    /**
+     * @name Implementation of Lua::IPluginUiHost
+     * @{
+     */
+    std::vector<Lua::IPluginUiHost::DialogInfo> dialogs() const override;
+    bool close_dialog(const std::string& name) override;
+    void close_all_dialogs() override;
+    void discard_crashed_projects() override;
+    /** @} */
 
     void navigate_to_item(const Domain::ConfigItem* config_item);
 
@@ -314,6 +325,7 @@ private:
     Navigator* m_render_module_navigator{nullptr};
 
     DialogNavigation m_dialog_navigation;
+    std::vector<std::pair<std::string, Yoga::Popup*>> m_named_dialogs; // for Lua::IPluginUiHost
 
     std::set<Yoga::Dialog*> m_gizmo_dialogs;
 };

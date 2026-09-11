@@ -11,11 +11,17 @@
 #include "Slic3r/Biz/Emboss/TextShapeProvider.hpp"
 #include "Slic3r/Biz/Format/STL.hpp"
 #include "Slic3r/Biz/Lua/LuaException.hpp"
+#include "Slic3r/Biz/ResultExport/ExportNameParser.hpp"
 #include "Slic3r/Domain/ModelInstance.hpp"
 #include "Slic3r/Domain/ModelObject.hpp"
 #include "Slic3r/Domain/Project.hpp"
 
 #include <fmt/ranges.h>
+#include <boost/filesystem.hpp>
+#include <algorithm>
+#include <cctype>
+#include <set>
+#include <sstream>
 
 //--@file _globals.lua
 //--@meta _G
@@ -204,6 +210,174 @@ struct ModelElement
     }
 };
 
+// Switching whole presets: printer, print (quality), material (filament), nozzle (per tool), sheet.
+struct PresetsLuaApi
+{
+    Biz::ProjectInteractor* project_interactor{nullptr};
+
+    struct Entry
+    {
+        std::string id, name, group;
+        bool selected{false};
+    };
+
+    Biz::Preset::PresetInteractor& presets() const { return project_interactor->preset_interactor(); }
+
+    std::vector<Entry> entries(const std::string& kind, size_t index) const
+    {
+        std::vector<Entry> out;
+        auto& pi = presets();
+        auto from_list = [&out](const auto& list, auto name_of, auto group_of)
+        {
+            const auto& items = list.items();
+            for (size_t i = 0; i < items.size(); ++i) {
+                out.push_back({items.at(i).id, name_of(items.at(i)), group_of(items.at(i)), i == list.selected_index()});
+            }
+        };
+        auto preset_name  = [](const Biz::Preset::PresetItem& p) { return p.name; };
+        auto preset_group = [](const Biz::Preset::PresetItem& p) { return p.hw_printer_config_name; };
+        auto no_group     = [](const auto&) { return std::string(); };
+        auto def_name     = [](const auto& d) { return d.name; };
+
+        if (kind == "printer") {
+            from_list(pi.printer_presets(), preset_name, preset_group);
+        } else if (kind == "print") {
+            from_list(pi.print_presets(), preset_name, no_group);
+        } else if (kind == "material" || kind == "filament") {
+            if (index >= pi.material_presets().size()) {
+                throw Biz::Lua::LuaException(fmt::format("Material slot {} out of range, there are {} slot(s)", index, pi.material_presets().size()));
+            }
+            from_list(pi.material_presets().at(index), preset_name, no_group);
+        } else if (kind == "nozzle" || kind == "tool") {
+            if (index >= pi.tool_items().size()) {
+                throw Biz::Lua::LuaException(fmt::format("Tool index {} out of range, the printer has {} tool(s)", index, pi.tool_items().size()));
+            }
+            from_list(pi.tool_items().at(index), def_name, no_group);
+        } else if (kind == "sheet") {
+            from_list(pi.sheet_items(), def_name, no_group);
+        } else {
+            throw Biz::Lua::LuaException("Unknown preset kind, use printer, print, material, nozzle or sheet");
+        }
+        return out;
+    }
+
+    sol::table list(sol::this_state ts, const std::string& kind, sol::optional<size_t> index) const
+    {
+        sol::state_view lua(ts);
+        sol::table t = lua.create_table();
+        int i = 1;
+        for (const auto& e : entries(kind, index.value_or(0))) {
+            sol::table row = lua.create_table();
+            row["id"]       = e.id;
+            row["name"]     = e.name;
+            row["selected"] = e.selected;
+            if (!e.group.empty()) {
+                row["printer"] = e.group;
+            }
+            t[i++] = row;
+        }
+        return t;
+    }
+
+    std::string selected(const std::string& kind, sol::optional<size_t> index) const
+    {
+        for (const auto& e : entries(kind, index.value_or(0))) {
+            if (e.selected) {
+                return e.name;
+            }
+        }
+        return {};
+    }
+
+    // Selects by id or by name (case-insensitive, and a unique substring match is accepted).
+    std::string select(const std::string& kind, const std::string& id_or_name, sol::optional<size_t> index)
+    {
+        const size_t idx = index.value_or(0);
+        const auto all   = entries(kind, idx);
+        auto lower = [](std::string v) { std::transform(v.begin(), v.end(), v.begin(), [](unsigned char c) { return std::tolower(c); }); return v; };
+        const std::string wanted = lower(id_or_name);
+
+        const Entry* match = nullptr;
+        for (const auto& e : all) {
+            if (e.id == id_or_name || lower(e.name) == wanted) {
+                match = &e;
+                break;
+            }
+        }
+        if (match == nullptr) {
+            std::vector<const Entry*> partial;
+            for (const auto& e : all) {
+                if (lower(e.name).find(wanted) != std::string::npos) {
+                    partial.push_back(&e);
+                }
+            }
+            if (partial.size() == 1) {
+                match = partial.front();
+            } else if (partial.size() > 1) {
+                std::string names;
+                for (const auto* e : partial) {
+                    names += (names.empty() ? "" : ", ") + e->name;
+                }
+                throw Biz::Lua::LuaException(fmt::format("'{}' is ambiguous, matches: {}", id_or_name, names));
+            }
+        }
+        if (match == nullptr) {
+            throw Biz::Lua::LuaException(fmt::format("No {} preset named '{}'", kind, id_or_name));
+        }
+
+        auto& pi = presets();
+        if (kind == "printer") {
+            const auto& items = pi.printer_presets().items();
+            for (size_t i = 0; i < items.size(); ++i) {
+                if (items.at(i).id == match->id) {
+                    pi.select_printer_preset(items.at(i).hw_printer_config_id, items.at(i).id, true);
+                    break;
+                }
+            }
+        } else if (kind == "print") {
+            pi.select_print_preset(match->id, true);
+        } else if (kind == "material" || kind == "filament") {
+            pi.select_material_preset(idx, match->id, true);
+        } else if (kind == "nozzle" || kind == "tool") {
+            if (!pi.select_printer_tool_item(idx, match->id, true)) {
+                throw Biz::Lua::LuaException(fmt::format("Nozzle '{}' could not be selected", match->name));
+            }
+        } else if (kind == "sheet") {
+            if (!pi.select_printer_sheet(match->id, true)) {
+                throw Biz::Lua::LuaException(fmt::format("Sheet '{}' could not be selected", match->name));
+            }
+        }
+        return match->name;
+    }
+};
+
+struct UiLuaApi
+{
+    IPluginUiHost* host{nullptr};
+
+    IPluginUiHost& require_host() const
+    {
+        if (host == nullptr) {
+            throw Biz::Lua::LuaException("The UI is not available in this context");
+        }
+        return *host;
+    }
+
+    sol::table dialogs(sol::this_state ts) const
+    {
+        sol::state_view lua(ts);
+        sol::table t = lua.create_table();
+        for (const auto& d : require_host().dialogs()) {
+            t[d.name] = d.open;
+        }
+        return t;
+    }
+
+    bool close_dialog(const std::string& name) const { return require_host().close_dialog(name); }
+    void close_dialogs() const { require_host().close_all_dialogs(); }
+    void discard_crashed_projects() const { require_host().discard_crashed_projects(); }
+};
+
 struct BedInstRef
 {
     Biz::ProjectInteractor& project_interactor;
@@ -247,12 +421,20 @@ struct BedInstRef
 
     Domain::ConfigBox& tool_print_presets(size_t tool_idx)
     {
-        return config_container().mutable_selected_preset().tools.at(tool_idx).config_box();
+        auto& tools = config_container().mutable_selected_preset().tools;
+        if (tool_idx >= tools.size()) {
+            throw Biz::Lua::LuaException(fmt::format("Tool index {} out of range, the printer has {} tool(s) (indices start at 0)", tool_idx, tools.size()));
+        }
+        return tools[tool_idx].config_box();
     }
 
     Domain::ConfigBox& material_presets(size_t slot_idx)
     {
-        return config_container().mutable_selected_preset().materials.at(slot_idx).config_box();
+        auto& materials = config_container().mutable_selected_preset().materials;
+        if (slot_idx >= materials.size()) {
+            throw Biz::Lua::LuaException(fmt::format("Material slot {} out of range, there are {} slot(s) (indices start at 0)", slot_idx, materials.size()));
+        }
+        return materials[slot_idx].config_box();
     }
 };
 
@@ -292,6 +474,73 @@ Domain::FloatOrPercentage parse_float_or_percentage(const sol::object& o)
     return {o.as<double>()};
 }
 
+// Converts any config item to a plain Lua value: numbers, booleans, strings, "15%" for
+// percentages, {x, y} for 2D vectors, enums as their serialized name, lists as tables.
+sol::object config_value_to_lua(sol::this_state ts, const Domain::ConfigItem& item)
+{
+    sol::state_view lua(ts);
+    auto pct   = [](const Domain::Percentage& p) { return fmt::format("{}%", p.value); };
+    auto fpct  = [&lua, &pct](const Domain::FloatOrPercentage& fp) -> sol::object
+    {
+        return fp.is_percentage() ? sol::make_object(lua, pct(fp.percentage())) : sol::make_object(lua, fp.float_value());
+    };
+    auto vec2  = [&lua](const Domain::Vec2d& v)
+    {
+        sol::table t = lua.create_table();
+        t[1] = v.x();
+        t[2] = v.y();
+        return t;
+    };
+    auto list = [&lua](const auto& values, auto conv)
+    {
+        sol::table t = lua.create_table();
+        int i = 1;
+        for (const auto& v : values) {
+            t[i++] = conv(v);
+        }
+        return t;
+    };
+    return item.visit(Domain::overloaded{
+        [&lua](const Domain::EnumWrapper& e) -> sol::object { return sol::make_object(lua, std::string(e.get_string())); },
+        [&lua](bool v) -> sol::object { return sol::make_object(lua, v); },
+        [&lua](int v) -> sol::object { return sol::make_object(lua, v); },
+        [&lua](const std::optional<int>& v) -> sol::object { return v.has_value() ? sol::make_object(lua, *v) : sol::lua_nil; },
+        [&lua](double v) -> sol::object { return sol::make_object(lua, v); },
+        [&lua](const std::string& v) -> sol::object { return sol::make_object(lua, v); },
+        [&vec2](const Domain::Vec2d& v) -> sol::object { return vec2(v); },
+        [&fpct](const Domain::FloatOrPercentage& v) -> sol::object { return fpct(v); },
+        [&lua, &pct](const Domain::Percentage& v) -> sol::object { return sol::make_object(lua, pct(v)); },
+        [&list](const std::vector<bool>& v) -> sol::object { return list(v, [](bool b) { return b; }); },
+        [&list](const std::vector<int>& v) -> sol::object { return list(v, [](int i) { return i; }); },
+        [&lua, &list](const std::vector<std::optional<int>>& v) -> sol::object
+        { return list(v, [&lua](const std::optional<int>& i) -> sol::object { return i.has_value() ? sol::make_object(lua, *i) : sol::lua_nil; }); },
+        [&list](const std::vector<double>& v) -> sol::object { return list(v, [](double d) { return d; }); },
+        [&list](const std::vector<std::string>& v) -> sol::object { return list(v, [](const std::string& s) { return s; }); },
+        [&list, &vec2](const std::vector<Domain::Vec2d>& v) -> sol::object { return list(v, vec2); },
+        [&list, &fpct](const std::vector<Domain::FloatOrPercentage>& v) -> sol::object { return list(v, fpct); },
+        [&list, &pct](const std::vector<Domain::Percentage>& v) -> sol::object { return list(v, pct); },
+        [&lua](const auto&) -> sol::object
+        {
+            throw Biz::Lua::LuaException("Unsupported config type (enum list)");
+        }
+    });
+}
+
+template<typename T, typename Conv>
+std::vector<T> lua_list(const sol::object& val, Conv conv)
+{
+    std::vector<T> out;
+    if (val.is<sol::table>()) {
+        sol::table t = val;
+        for (size_t i = 1; i <= t.size(); ++i) {
+            out.push_back(conv(t[i]));
+        }
+    } else {
+        out.push_back(conv(val));
+    }
+    return out;
+}
+
 bool set_param(Domain::ConfigBox& settings, const std::string& name, const sol::object& val)
 {
     auto it      = settings.find(name);
@@ -316,9 +565,54 @@ bool set_param(Domain::ConfigBox& settings, const std::string& name, const sol::
                 {
                     dest_val = parse_float_or_percentage(val);
                 },
+                [&val](bool& dest_val)
+                {
+                    if (val.is<bool>()) {
+                        dest_val = val.as<bool>();
+                    } else {
+                        const std::string s = val.as<std::string>();
+                        dest_val = (s == "1" || s == "true" || s == "on" || s == "yes");
+                    }
+                },
+                [&val](std::string& dest_val)
+                {
+                    dest_val = val.as<std::string>();
+                },
+                [&val](Domain::Vec2d& dest_val)
+                {
+                    sol::table t = val;
+                    dest_val = Domain::Vec2d(t.get_or(1, 0.0), t.get_or(2, 0.0));
+                },
+                [&val](std::vector<bool>& dest_val)
+                {
+                    dest_val = lua_list<bool>(val, [](const sol::object& o) { return o.as<bool>(); });
+                },
+                [&val](std::vector<int>& dest_val)
+                {
+                    dest_val = lua_list<int>(val, [](const sol::object& o) { return o.as<int>(); });
+                },
+                [&val](std::vector<double>& dest_val)
+                {
+                    dest_val = lua_list<double>(val, [](const sol::object& o) { return o.as<double>(); });
+                },
+                [&val](std::vector<std::string>& dest_val)
+                {
+                    dest_val = lua_list<std::string>(val, [](const sol::object& o) { return o.as<std::string>(); });
+                },
+                [&val](std::vector<Domain::Percentage>& dest_val)
+                {
+                    dest_val = lua_list<Domain::Percentage>(val, [](const sol::object& o) { return parse_percentage(o); });
+                },
+                [&val](std::vector<Domain::FloatOrPercentage>& dest_val)
+                {
+                    dest_val = lua_list<Domain::FloatOrPercentage>(val, [](const sol::object& o) { return parse_float_or_percentage(o); });
+                },
                 [&val, &it](Domain::EnumWrapper& dest_val)
                 {
-                    std::string enum_name = val.as<std::string>();
+                    const std::string enum_name = val.is<std::string>() ? val.as<std::string>() :
+                                                  val.is<bool>()        ? std::string(val.as<bool>() ? "true" : "false") :
+                                                  val.is<double>()      ? fmt::format("{}", val.as<double>()) :
+                                                                          std::string();
                     const bool contains   = std::ranges::any_of(
                         dest_val.def(),
                         [&enum_name](const Domain::EnumValueDef& d)
@@ -327,8 +621,8 @@ bool set_param(Domain::ConfigBox& settings, const std::string& name, const sol::
                     if (contains) {
                         dest_val.set_string(enum_name);
                     } else {
-                        SPDLOG_ERROR(
-                            "Unknown enum value {} for {}, allowed values are: {}",
+                        throw Biz::Lua::LuaException(fmt::format(
+                            "Unknown value '{}' for {}, allowed values are: {}",
                             enum_name,
                             it.item->def().name,
                             fmt::join(
@@ -339,7 +633,7 @@ bool set_param(Domain::ConfigBox& settings, const std::string& name, const sol::
                                     ),
                                 ", "
                             )
-                        );
+                        ));
                     }
                 },
                 [&success](auto& val)
@@ -442,6 +736,69 @@ struct ProjectLuaApi
 {
     Biz::ProjectInteractor& project_interactor;
     size_t project_id;
+    ProjectApi::Permissions permissions{};
+
+    // ---- slicing and export of the selected bed
+
+    void slice()
+    {
+        project_interactor.slicing_interactor().slice_bed(project_interactor.selected_bed_slicing_id());
+    }
+
+    sol::table slicing_status(sol::this_state ts) const
+    {
+        sol::state_view lua(ts);
+        sol::table t = lua.create_table();
+        const auto status = project_interactor.status_cache().get_status(project_interactor.selected_bed_slicing_id());
+        if (!status.has_value()) {
+            t["code"] = "Unknown";
+            return t;
+        }
+        std::ostringstream code;
+        code << status->code;
+        t["code"]     = code.str();
+        t["finished"] = status->code == Biz::Slicing::StatusCode::Finished;
+        t["failed"]   = status->code == Biz::Slicing::StatusCode::InvalidData
+                     || status->code == Biz::Slicing::StatusCode::Empty
+                     || status->code == Biz::Slicing::StatusCode::Removed;
+        if (status->progress.has_value()) {
+            t["progress"] = status->progress->progress.value;
+        }
+        std::ostringstream errors;
+        for (const auto& e : status->errors) {
+            errors << e << "\n";
+        }
+        t["errors"] = errors.str();
+        return t;
+    }
+
+    // Starts the export of the last slicing result; returns the path that will be written.
+    std::string export_gcode(const std::string& path)
+    {
+        if (!permissions.export_files) {
+            throw Biz::Lua::LuaException("export_gcode is not permitted for installed plugins");
+        }
+        const auto slicing_id = project_interactor.selected_bed_slicing_id();
+        const auto status     = project_interactor.status_cache().get_status(slicing_id);
+        if (!status.has_value() || status->code != Biz::Slicing::StatusCode::Finished) {
+            throw Biz::Lua::LuaException("Nothing to export: slice the bed first and wait until slicing_status().finished is true");
+        }
+        boost::filesystem::path dest(path);
+        if (path.empty() || boost::filesystem::is_directory(dest)) {
+            std::string filename = "output.gcode";
+            try {
+                const auto name_data = Biz::ExportNameParser::parse_export_name(project_interactor);
+                if (!name_data.filename.empty()) {
+                    filename = name_data.filename;
+                }
+            } catch (const std::exception& e) {
+                SPDLOG_WARN("Cannot build the default export name: {}", e.what());
+            }
+            dest /= filename;
+        }
+        project_interactor.do_result_export(slicing_id, dest);
+        return dest.string();
+    }
 
     ModelElement add_object(const sol::table& def)
     {
@@ -496,8 +853,44 @@ struct ProjectLuaApi
         return {project_id, sel.elements.front(), &project_interactor};
     }
 
-    // One element per model instance currently in the project.
-    sol::as_table_t<std::vector<ModelElement>> objects() const
+    // Imports model files (STL, 3MF, OBJ, ...) the way File > Import does, returns the new instances.
+    sol::as_table_t<std::vector<ModelElement>> import_models(const sol::table& paths)
+    {
+        if (!permissions.import_files) {
+            throw Biz::Lua::LuaException("import_models is not permitted for installed plugins, use load_stl");
+        }
+        std::vector<boost::filesystem::path> files;
+        paths.for_each([&files](const sol::object&, const sol::object& value)
+        {
+            if (value.is<std::string>()) {
+                files.emplace_back(value.as<std::string>());
+            }
+        });
+        if (files.empty()) {
+            throw Biz::Lua::LuaException("import_models needs a list of file paths");
+        }
+        for (const auto& f : files) {
+            if (!boost::filesystem::is_regular_file(f)) {
+                throw Biz::Lua::LuaException(fmt::format("File not found: {}", f.string()));
+            }
+        }
+
+        std::set<std::pair<size_t, size_t>> before;
+        for (const auto& el : collect_objects()) {
+            before.emplace(el.ref.object_id, el.ref.instance_id);
+        }
+        project_interactor.load_models_to_project(files);
+
+        std::vector<ModelElement> added;
+        for (const auto& el : collect_objects()) {
+            if (!before.contains({el.ref.object_id, el.ref.instance_id})) {
+                added.push_back(el);
+            }
+        }
+        return sol::as_table(std::move(added));
+    }
+
+    std::vector<ModelElement> collect_objects() const
     {
         std::vector<ModelElement> result;
         const auto& model = project_interactor.project(project_id).model();
@@ -506,7 +899,13 @@ struct ProjectLuaApi
                 result.push_back({project_id, Domain::ElementRef{obj->id().id, inst->id().id}, &project_interactor});
             }
         }
-        return sol::as_table(std::move(result));
+        return result;
+    }
+
+    // One element per model instance currently in the project.
+    sol::as_table_t<std::vector<ModelElement>> objects() const
+    {
+        return sol::as_table(collect_objects());
     }
 
     ModelElement add_volume(const ModelElement& target, Domain::ModelVolumeType vol_type, const Mesh& mesh)
@@ -775,22 +1174,17 @@ sol::object feature_value(
     return feature_value(lua, it->second);
 }
 
-using ExposedConfigValue = std::variant<
-    bool,
-    int,
-    std::optional<int>,
-    double,
-    std::string,
-    Domain::Vec2d,
-    Domain::FloatOrPercentage,
-    Domain::Percentage>;
 
 ProjectApi::ProjectApi(
     Biz::ProjectInteractor& project_interactor,
-    Biz::Emboss::IFontManager& font_manager
+    Biz::Emboss::IFontManager& font_manager,
+    Permissions permissions,
+    IPluginUiHost* ui_host
 ) :
     m_project_interactor(project_interactor),
     m_font_manager(font_manager),
+    m_permissions(permissions),
+    m_ui_host(ui_host),
     m_text_preset_manager(
         font_manager,
         Slic3r::data_dir() + "/text_emboss_presets_scripts.cereal",
@@ -944,8 +1338,12 @@ void ProjectApi::register_api(Biz::Lua::LuaEngine& lua)
     //--@param name string The config key.
     //--@param value any The value to set.
     //- function ConfigBox:set(name, value) end
+
+    //-- Lists all config keys in this box.
+    //--@return string[]
+    //- function ConfigBox:keys() end
     state.new_usertype<Domain::ConfigBox>("ConfigBox", sol::no_constructor,
-        "value", [](const Domain::ConfigBox& config, const std::string& name) -> ExposedConfigValue
+        "value", [](sol::this_state ts, const Domain::ConfigBox& config, const std::string& name) -> sol::object
         {
             const auto it = config.find(name);
             if (!it.item) {
@@ -953,23 +1351,23 @@ void ProjectApi::register_api(Biz::Lua::LuaEngine& lua)
                     fmt::format("Invalid preset item name '{}': not found", name)
                 );
             }
-            return it.item->visit(
-                Domain::overloaded{
-                    []<typename T>(const T& item) -> ExposedConfigValue
-                    requires Domain::is_in_variant<T, ExposedConfigValue>::value
-                    { return item; },
-
-                    []<typename T>(const T&) -> ExposedConfigValue
-                    requires (!Domain::is_in_variant<T, ExposedConfigValue>::value)
-                    {
-                        throw Biz::Lua::LuaException("Unsupported config type");
-                    }
-                }
-            );
+            return config_value_to_lua(ts, *it.item);
         },
         "set", [](Domain::ConfigBox& config, const std::string& name, const sol::object& value)
         {
-            set_param(config, name, value);
+            if (!set_param(config, name, value)) {
+                throw Biz::Lua::LuaException(fmt::format("Cannot set preset item '{}': not found", name));
+            }
+        },
+        "keys", [](sol::this_state ts, const Domain::ConfigBox& config) -> sol::table
+        {
+            sol::state_view lua(ts);
+            sol::table t = lua.create_table();
+            int i = 1;
+            for (const auto& item : config.items.all_items()) {
+                t[i++] = item.name();
+            }
+            return t;
         }
     );
 
@@ -1110,10 +1508,33 @@ void ProjectApi::register_api(Biz::Lua::LuaEngine& lua)
     //-- Lists the model instances currently in the project, one element per instance.
     //--@return ModelElement[]
     //- function ProjectApi:objects() end
+
+    //-- Imports model files (STL, 3MF, OBJ, ...) like File > Import and arranges them on the bed.
+    //-- Only available to scripts run through the plugin server.
+    //--@param paths string[]
+    //--@return ModelElement[] added The newly added instances.
+    //- function ProjectApi:import_models(paths) end
+
+    //-- Starts slicing the selected bed in the background. Poll slicing_status() for the result.
+    //- function ProjectApi:slice() end
+
+    //-- Slicing state of the selected bed.
+    //--@return table status Fields: code (string), finished (boolean), failed (boolean), progress (number, 0-100), errors (string)
+    //- function ProjectApi:slicing_status() end
+
+    //-- Starts exporting the finished slicing result. If path is a directory or empty, the configured output name is used.
+    //-- Only available to scripts run through the plugin server.
+    //--@param path string
+    //--@return string path The file that will be written.
+    //- function ProjectApi:export_gcode(path) end
     state.new_usertype<ProjectLuaApi>("ProjectApi",
         sol::no_constructor,
         "add_object", &ProjectLuaApi::add_object,
         "objects", &ProjectLuaApi::objects,
+        "import_models", &ProjectLuaApi::import_models,
+        "slice", &ProjectLuaApi::slice,
+        "slicing_status", &ProjectLuaApi::slicing_status,
+        "export_gcode", &ProjectLuaApi::export_gcode,
         "insert_layer_custom_gcode", &ProjectLuaApi::insert_layer_custom_gcode,
         "clear_layer_custom_steps", &ProjectLuaApi::clear_layer_custom_steps,
         "current_bed", &ProjectLuaApi::current_bed
@@ -1132,7 +1553,66 @@ void ProjectApi::register_api(Biz::Lua::LuaEngine& lua)
     //--@type ProjectApi
     //- local projectApi = {}
     //- api.project = projectApi
-    api["project"] = ProjectLuaApi(m_project_interactor, m_project_interactor.selected_project_id());
+    api["project"] = ProjectLuaApi{m_project_interactor, m_project_interactor.selected_project_id(), m_permissions};
+
+    //--@class UiApi
+    //- local UiApi = {}
+
+    //-- Dialogs known to the application, name -> whether it is currently open.
+    //--@return table<string, boolean>
+    //- function UiApi:dialogs() end
+
+    //-- Closes one dialog by name (see dialogs()).
+    //--@param name string
+    //--@return boolean known Whether the name was recognised.
+    //- function UiApi:close_dialog(name) end
+
+    //-- Closes every dialog.
+    //- function UiApi:close_dialogs() end
+
+    //-- Dismisses the crash recovery dialog and discards the recovered projects.
+    //- function UiApi:discard_crashed_projects() end
+    state.new_usertype<UiLuaApi>("UiApi",
+        sol::no_constructor,
+        "dialogs", &UiLuaApi::dialogs,
+        "close_dialog", &UiLuaApi::close_dialog,
+        "close_dialogs", &UiLuaApi::close_dialogs,
+        "discard_crashed_projects", &UiLuaApi::discard_crashed_projects
+    );
+    //--@type UiApi
+    //- api.ui = {}
+    api["ui"] = UiLuaApi{m_ui_host};
+
+    //--@class PresetsApi
+    //- local PresetsApi = {}
+
+    //-- Lists presets of a kind: "printer", "print", "material" (index = slot), "nozzle" (index = tool) or "sheet".
+    //--@param kind string
+    //--@param index? integer
+    //--@return table[] entries Each with id, name, selected and, for printers, printer.
+    //- function PresetsApi:list(kind, index) end
+
+    //-- Name of the selected preset of a kind.
+    //--@param kind string
+    //--@param index? integer
+    //--@return string
+    //- function PresetsApi:selected(kind, index) end
+
+    //-- Selects a preset by id or name (case-insensitive, unique substring accepted).
+    //--@param kind string
+    //--@param id_or_name string
+    //--@param index? integer
+    //--@return string name The name of the selected preset.
+    //- function PresetsApi:select(kind, id_or_name, index) end
+    state.new_usertype<PresetsLuaApi>("PresetsApi",
+        sol::no_constructor,
+        "list", &PresetsLuaApi::list,
+        "selected", &PresetsLuaApi::selected,
+        "select", &PresetsLuaApi::select
+    );
+    //--@type PresetsApi
+    //- api.presets = {}
+    api["presets"] = PresetsLuaApi{&m_project_interactor};
     //-- Creates a cube mesh.
     //--@param width number Width [mm]
     //--@param height number Height [mm]

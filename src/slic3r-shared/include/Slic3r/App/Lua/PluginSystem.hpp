@@ -7,6 +7,7 @@
 #include "Slic3r/App/Lua/PluginRegistry.hpp"
 #include "Slic3r/App/Lua/IPluginRescanListener.hpp"
 #include "Slic3r/App/Lua/IPluginInstallationListener.hpp"
+#include "Slic3r/App/Lua/IPluginUiHost.hpp"
 #include "Slic3r/Biz/ProjectInteractor.hpp"
 #include "Slic3r/Biz/Emboss/IFontManager.hpp"
 #include "Slic3r/Biz/Platform//WithListeners.hpp"
@@ -43,6 +44,9 @@ public:
     /** Start the local plugin server if it was requested on the command line. */
     void start_server_if_requested();
     void stop_server();
+
+    /** UI operations available to scripts as api.ui; may be null (CLI). */
+    void set_ui_host(IPluginUiHost* ui_host) { m_ui_host = ui_host; }
     void rescan();
     const auto& plugins() const { return m_registry.plugins(); }
 
@@ -67,6 +71,7 @@ private:
     std::optional<PluginData> m_current_plugin_data, m_last_plugin_data;
     Yoga::Passthrough<PluginDialog> m_dialog;
     std::unique_ptr<PluginServer> m_server;
+    IPluginUiHost* m_ui_host{nullptr};
 };
 
 } // namespace Slic3r::App::Lua

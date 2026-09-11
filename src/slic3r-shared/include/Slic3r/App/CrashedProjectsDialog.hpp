@@ -30,6 +30,9 @@ public:
 
     void on_project_restore_completed() override;
 
+    /** Discards every listed project and closes the dialog. */
+    void discard_all();
+
 private:
     void update_button_label();
 

@@ -9,7 +9,8 @@ data directory and removes it on exit.
     POST /lua  {"code": "<lua>"}   -> {"ok": bool, "output": "...", "result": "...", "error": "..."}
 
 Every request needs `Authorization: Bearer <token>`. Each request becomes one
-undo step, like a plugin run.
+undo step, like a plugin run. Scripts run through the server may call
+`api.project:export_gcode(path)`, which installed plugins may not.
 
 ## Client
 
@@ -26,9 +27,22 @@ Or with curl:
 
 ## MCP server
 
-`prusaslicer_mcp.py` exposes the API as MCP tools (`list_objects`, `move_object`,
-`rotate_object`, `scale_object`, `rename_object`, `remove_object`, `add_cube`,
-`run_lua`, `ping`). It needs the `mcp` package. Register it in Claude Code with:
+`prusaslicer_mcp.py` exposes the API as MCP tools:
+
+- objects: `list_objects`, `move_object`, `set_position`, `rotate_object`,
+  `scale_object`, `rename_object`, `remove_object`, `add_cube`
+- slicing: `slice` (waits by default), `slicing_status`, `export_gcode`
+  (file or directory, waits for the file)
+- settings: `get_setting`, `set_setting`, `list_settings` with scope
+  `print`, `printer`, `material`/`filament` or `tool`
+- presets: `current_presets`, `list_presets`, `select_preset` for print
+  quality, filament, nozzle, printer and sheet
+- import: `import_models` (STL, 3MF, OBJ, ... like File > Import)
+- dialogs: `list_dialogs`, `close_dialog`, `close_all_dialogs`,
+  `discard_crashed_projects` (dismisses the project recovery pane)
+- `run_lua` for anything else, `ping`
+
+It needs the `mcp` package (Fedora: `python3-mcp`). Register it in Claude Code with:
 
     claude mcp add prusaslicer -e PRUSASLICER_DATADIR=/path/to/datadir -- python3 /path/to/prusaslicer_mcp.py
 

@@ -197,6 +197,20 @@ void CrashedProjectsDialog::on_crashed_projects_detected(
     m_navigator.set_modal_dialog(ModalDialog::CrashedProjects);
 }
 
+void CrashedProjectsDialog::discard_all()
+{
+    if (m_projects.empty()) {
+        m_navigator.set_modal_dialog(ModalDialog::None);
+        return;
+    }
+    std::vector<std::pair<boost::filesystem::path, bool>> paths;
+    paths.reserve(m_projects.size());
+    for (CrashedProjectEntry* entry : std::as_const(m_projects)) {
+        paths.emplace_back(entry->path(), false);
+    }
+    m_project_interactor.backup_store().restore_backups(paths);
+}
+
 void CrashedProjectsDialog::on_project_restore_completed()
 {
     m_navigator.set_modal_dialog(ModalDialog::None);

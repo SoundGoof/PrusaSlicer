@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
 """MCP server that drives a running PrusaSlicer through its plugin server.
 
-Requires the `mcp` package (pip install mcp) and PrusaSlicer started with
+Requires the `mcp` package (Fedora: python3-mcp) and PrusaSlicer started with
 --plugin-server. Every tool is a thin wrapper that sends Lua to PrusaSlicer;
-the Lua plugin API (api.project, ModelElement, ...) does the actual work.
+the Lua plugin API (api.project, ModelElement, ConfigBox, ...) does the work.
 
 Register in Claude Code with:
 
@@ -12,6 +12,7 @@ Register in Claude Code with:
 import json
 import os
 import sys
+import time
 from pathlib import Path
 
 from mcp.server.fastmcp import FastMCP
@@ -21,6 +22,14 @@ from prusaslicer_client import PluginServerClient  # noqa: E402
 
 mcp = FastMCP("prusaslicer")
 _client = PluginServerClient(os.environ.get("PRUSASLICER_DATADIR"))
+
+SCOPES = {
+    "print": "bed:print_presets()",
+    "printer": "bed:printer_presets()",
+    "material": "bed:material_presets({index})",
+    "filament": "bed:material_presets({index})",
+    "tool": "bed:tool_print_presets({index})",
+}
 
 
 def _run(code: str) -> str:
@@ -36,9 +45,60 @@ def _run(code: str) -> str:
     return "\n".join(parts) if parts else "ok"
 
 
+def _run_json(code: str) -> dict:
+    """Run Lua that returns a JSON string built by the _json helper."""
+    res = _client.run(_JSON_HELPER + code)
+    if not res.get("ok"):
+        raise RuntimeError(res.get("error") or "unknown Lua error")
+    return json.loads(res.get("result") or "{}")
+
+
+_JSON_HELPER = r"""
+local function _json(v)
+    local t = type(v)
+    if t == "table" then
+        if #v > 0 or next(v) == nil then
+            local parts = {}
+            for _, x in ipairs(v) do parts[#parts + 1] = _json(x) end
+            return "[" .. table.concat(parts, ",") .. "]"
+        end
+        local parts = {}
+        for k, x in pairs(v) do parts[#parts + 1] = string.format("%q:%s", tostring(k), _json(x)) end
+        return "{" .. table.concat(parts, ",") .. "}"
+    elseif t == "string" then
+        return string.format("%q", v):gsub("\\\n", "\\n")
+    elseif t == "number" or t == "boolean" then
+        return tostring(v)
+    else
+        return "null"
+    end
+end
+"""
+
+
 def _lua_string(s: str) -> str:
     return json.dumps(s)  # JSON string literals are valid Lua string literals
 
+
+def _lua_value(value: str) -> str:
+    """Turn a user supplied string into a Lua literal: booleans, numbers, else string."""
+    v = value.strip()
+    if v.lower() in ("true", "false"):
+        return v.lower()
+    try:
+        float(v)
+        return v
+    except ValueError:
+        return _lua_string(value)
+
+
+def _scope_expr(scope: str, index: int) -> str:
+    if scope not in SCOPES:
+        raise ValueError(f"scope must be one of {', '.join(SCOPES)}")
+    return SCOPES[scope].format(index=int(index))
+
+
+# ---------------------------------------------------------------- basics
 
 @mcp.tool()
 def ping() -> str:
@@ -51,14 +111,17 @@ def ping() -> str:
 def run_lua(code: str) -> str:
     """Run arbitrary Lua in PrusaSlicer's plugin sandbox and return what it printed and returned.
 
-    The `api` global is available, e.g. `api.project:objects()`, `api.make_cube(w, h, d)`,
-    `api.project:add_object{mesh = ...}`. Object elements support name, object_id, instance_id,
-    printable, position(), rotation(), scale(), bounds(), translate(dx, dy, dz),
-    set_position(x, y, z), rotate(rx, ry, rz) [rad], scale_by(sx, sy, sz), set_scale(sx, sy, sz),
-    set_name(name), set_printable(bool) and remove_object().
+    The `api` global is available: api.project:objects(), api.project:add_object{mesh=..., name=...},
+    api.project:slice(), api.project:slicing_status(), api.project:export_gcode(path),
+    api.project:current_bed():print_presets():value(key) / :set(key, value) / :keys(),
+    api.make_cube(w, d, h) and the other mesh constructors. Object elements support name,
+    object_id, instance_id, printable, position(), rotation(), scale(), bounds(), translate(),
+    set_position(), rotate() [rad], scale_by(), set_scale(), set_name(), set_printable(), remove_object().
     """
     return _run(code)
 
+
+# ---------------------------------------------------------------- objects
 
 @mcp.tool()
 def list_objects() -> str:
@@ -128,12 +191,210 @@ def remove_object(object_id: int) -> str:
 
 
 @mcp.tool()
+def import_models(paths: list[str]) -> str:
+    """Import model files (STL, 3MF, OBJ, ...) onto the plate, like File > Import, and arrange them.
+
+    Paths must be absolute. Returns the ids of the added objects, which the other tools use.
+    """
+    lua_paths = ", ".join(_lua_string(str(Path(p).expanduser().resolve())) for p in paths)
+    return _run(
+        f"local added = api.project:import_models({{{lua_paths}}})\n"
+        "for _, el in ipairs(added) do local b = el:bounds()\n"
+        "  print(string.format('added %s object=%d instance=%d size=(%.1f x %.1f x %.1f) mm', el.name, el.object_id, el.instance_id, b.max_x - b.min_x, b.max_y - b.min_y, b.max_z - b.min_z)) end\n"
+        "if #added == 0 then print('nothing imported') end"
+    )
+
+
+@mcp.tool()
 def add_cube(width: float, depth: float, height: float, name: str = "Cube") -> str:
     """Add a box of the given size in millimetres to the plate."""
     return _run(
         f"local el = api.project:add_object{{mesh = api.make_cube({width}, {depth}, {height}), name = {_lua_string(name)}}}\n"
         "print(string.format('added %s as object %d', el.name, el.object_id))"
     )
+
+
+# ---------------------------------------------------------------- slicing and export
+
+def _status() -> dict:
+    return _run_json("return _json(api.project:slicing_status())")
+
+
+@mcp.tool()
+def slicing_status() -> str:
+    """Report the slicing state of the selected bed: code, progress, errors."""
+    return json.dumps(_status(), indent=2)
+
+
+@mcp.tool()
+def slice(wait: bool = True, timeout_s: float = 600) -> str:
+    """Slice the selected bed. With wait=True (default) blocks until slicing finished or failed."""
+    _run("api.project:slice()")
+    if not wait:
+        return "slicing started"
+    deadline = time.monotonic() + timeout_s
+    last = None
+    while time.monotonic() < deadline:
+        st = _status()
+        last = st
+        if st.get("finished"):
+            return "slicing finished"
+        if st.get("failed"):
+            return f"slicing failed ({st.get('code')}): {st.get('errors', '').strip()}"
+        time.sleep(0.5)
+    return f"timed out after {timeout_s}s, last status: {json.dumps(last)}"
+
+
+@mcp.tool()
+def export_gcode(path: str, wait: bool = True, timeout_s: float = 300) -> str:
+    """Export the finished slicing result as G-code to a file or into a directory.
+
+    If path is a directory the configured output filename is used. Slice first.
+    With wait=True (default) waits until the file exists and stops growing.
+    """
+    dest = _run("return api.project:export_gcode(" + _lua_string(path) + ")").removeprefix("=> ")
+    if not wait:
+        return f"export started: {dest}"
+    p = Path(dest)
+    deadline = time.monotonic() + timeout_s
+    last_size = -1
+    stable = 0
+    while time.monotonic() < deadline:
+        if p.exists():
+            size = p.stat().st_size
+            if size == last_size and size > 0:
+                stable += 1
+                if stable >= 3:
+                    return f"exported {dest} ({size} bytes)"
+            else:
+                stable = 0
+            last_size = size
+        time.sleep(0.5)
+    return f"timed out waiting for {dest}"
+
+
+# ---------------------------------------------------------------- presets
+
+PRESET_KINDS = ("printer", "print", "material", "nozzle", "sheet")
+
+
+def _kind(kind: str) -> str:
+    k = kind.strip().lower()
+    aliases = {"filament": "material", "quality": "print", "tool": "nozzle", "bed": "sheet"}
+    k = aliases.get(k, k)
+    if k not in PRESET_KINDS:
+        raise ValueError(f"kind must be one of {', '.join(PRESET_KINDS)} (aliases: filament, quality)")
+    return k
+
+
+@mcp.tool()
+def list_presets(kind: str = "print", index: int = 0) -> str:
+    """List selectable presets. kind: printer (printer model and nozzle variants), print (quality profiles
+    such as 0.15mm QUALITY), material or filament (per slot index), nozzle (per tool index), sheet.
+    The selected one is marked with *.
+    """
+    k = _kind(kind)
+    rows = _run_json(f"return _json(api.presets:list({_lua_string(k)}, {int(index)}))")
+    lines = []
+    for r in rows:
+        mark = "*" if r.get("selected") else " "
+        extra = f"  [{r['printer']}]" if r.get("printer") else ""
+        lines.append(f"{mark} {r['name']}{extra}")
+    return "\n".join(lines) if lines else "no presets"
+
+
+@mcp.tool()
+def select_preset(kind: str, name: str, index: int = 0) -> str:
+    """Switch a preset by name: kind print/quality (e.g. "0.15mm QUALITY"), material/filament
+    (e.g. "Prusament PETG"), nozzle (e.g. "0.6"), printer, or sheet. A unique part of the name is enough.
+    Unsaved edits to the previous preset are dropped, like choosing it in the sidebar.
+    """
+    k = _kind(kind)
+    return _run(f"print('selected ' .. api.presets:select({_lua_string(k)}, {_lua_string(name)}, {int(index)}))")
+
+
+@mcp.tool()
+def current_presets() -> str:
+    """Show the selected printer, print quality, filament(s), nozzle(s) and sheet."""
+    return _run(
+        """
+print("printer:  " .. api.presets:selected("printer"))
+print("print:    " .. api.presets:selected("print"))
+local bed = api.project:current_bed()
+local tools = bed:printer_config().tool_count
+for i = 0, tools - 1 do
+    print(string.format("tool %d:   nozzle %s, material %s", i, api.presets:selected("nozzle", i), api.presets:selected("material", i)))
+end
+print("sheet:    " .. api.presets:selected("sheet"))
+"""
+    )
+
+
+# ---------------------------------------------------------------- dialogs
+
+@mcp.tool()
+def list_dialogs() -> str:
+    """List the application's dialogs and which of them are open right now."""
+    d = _run_json("return _json(api.ui:dialogs())")
+    open_ones = sorted(k for k, v in d.items() if v)
+    closed = sorted(k for k, v in d.items() if not v)
+    return f"open: {', '.join(open_ones) or 'none'}\nclosed: {', '.join(closed)}"
+
+
+@mcp.tool()
+def close_dialog(name: str) -> str:
+    """Close one dialog by name, e.g. crashed_projects, welcome, preferences, print_settings. See list_dialogs."""
+    return _run(f"if api.ui:close_dialog({_lua_string(name)}) then print('closed') else error('unknown dialog: ' .. {_lua_string(name)}) end")
+
+
+@mcp.tool()
+def close_all_dialogs() -> str:
+    """Close every open dialog so the plater is usable again."""
+    return _run("api.ui:close_dialogs()\nprint('all dialogs closed')")
+
+
+@mcp.tool()
+def discard_crashed_projects() -> str:
+    """Dismiss the project recovery pane and discard the recovered (autosaved) projects."""
+    return _run("api.ui:discard_crashed_projects()\nprint('recovery pane dismissed, projects discarded')")
+
+
+# ---------------------------------------------------------------- settings
+
+@mcp.tool()
+def get_setting(key: str, scope: str = "print", index: int = 0) -> str:
+    """Read a slicer setting. scope: print, printer, material (filament) or tool; index selects the tool/material slot, starting at 0.
+
+    Examples: layer_height, fill_density, perimeters (print); nozzle_diameter (tool); temperature (material).
+    """
+    box = _scope_expr(scope, index)
+    value = _run_json(f"local bed = api.project:current_bed()\nreturn _json({{value = {box}:value({_lua_string(key)})}})").get("value")
+    return json.dumps(value) if isinstance(value, (list, dict)) else str(value)
+
+
+@mcp.tool()
+def set_setting(key: str, value: str, scope: str = "print", index: int = 0) -> str:
+    """Change a slicer setting for the current project. value is a string: numbers, true/false and
+    percentages like "15%" are accepted. scope: print, printer, material (filament) or tool.
+    """
+    box = _scope_expr(scope, index)
+    k = _lua_string(key)
+    return _run(
+        f"local bed = api.project:current_bed()\nlocal b = {box}\nb:set({k}, {_lua_value(value)})\n"
+        f"print({k} .. ' = ' .. tostring(b:value({k})))"
+    )
+
+
+@mcp.tool()
+def list_settings(scope: str = "print", index: int = 0, contains: str = "") -> str:
+    """List available setting keys in a scope, optionally only those containing a substring."""
+    box = _scope_expr(scope, index)
+    out = _run(
+        f"local bed = api.project:current_bed()\nlocal keys = {box}:keys()\ntable.sort(keys)\n"
+        f"local filter = {_lua_string(contains)}\n"
+        "for _, k in ipairs(keys) do if filter == '' or string.find(k, filter, 1, true) then print(k) end end"
+    )
+    return out
 
 
 if __name__ == "__main__":

@@ -163,6 +163,49 @@ void PlaterRenderModule::set_opened_dialog(Yoga::Dialog* opened_dialog)
     m_dialog_navigation.open_dialog(opened_dialog);
 }
 
+std::vector<Lua::IPluginUiHost::DialogInfo> PlaterRenderModule::dialogs() const
+{
+    std::vector<Lua::IPluginUiHost::DialogInfo> result;
+    for (const auto& [name, popup] : m_named_dialogs) {
+        result.push_back({name, popup != nullptr && popup->opened()});
+    }
+    return result;
+}
+
+bool PlaterRenderModule::close_dialog(const std::string& name)
+{
+    for (const auto& [dialog_name, popup] : m_named_dialogs) {
+        if (dialog_name == name) {
+            if (popup != nullptr) {
+                popup->close();
+                request_render();
+            }
+            return true;
+        }
+    }
+    return false;
+}
+
+void PlaterRenderModule::close_all_dialogs()
+{
+    set_modal_dialog(ModalDialog::None);
+    m_dialog_navigation.open_dialog(nullptr);
+    for (const auto& [name, popup] : m_named_dialogs) {
+        if (popup != nullptr) {
+            popup->close();
+        }
+    }
+    request_render();
+}
+
+void PlaterRenderModule::discard_crashed_projects()
+{
+    if (m_crashed_projects_dialog.get()) {
+        m_crashed_projects_dialog->discard_all();
+    }
+    request_render();
+}
+
 void PlaterRenderModule::set_modal_dialog(ModalDialog modal_dialog)
 {
     auto handle_dialog = [&](Yoga::Popup* dialog, ModalDialog modal){
@@ -345,10 +388,11 @@ void PlaterRenderModule::on_init(
     init_scene();
 
     m_plugin_system.rescan();
-    m_plugin_system.start_server_if_requested();
 
     init_scene_layout();
     init_dialog_navigation();
+    m_plugin_system.set_ui_host(this);
+    m_plugin_system.start_server_if_requested();
 
     if (!m_thumbnail_image_generator->initialized()) {
         m_thumbnail_image_generator->init(m_workbench, *m_device, *m_scene_presenter);
@@ -828,6 +872,25 @@ void PlaterRenderModule::init_dialog_navigation()
         &m_sidebar_action_buttons->physical_printer_advanced_settings_dialog(),
         &m_sidebar_action_buttons->physical_printer_settings_dialog()
     );
+
+    // Names used by the Lua UI API (api.ui)
+    m_named_dialogs = {
+        {"preferences", m_preferences_dialog.get()},
+        {"welcome", m_welcome_dialog.get()},
+        {"number_entry", m_number_entry_dialog.get()},
+        {"crashed_projects", m_crashed_projects_dialog.get()},
+        {"preset_updater", m_preset_updater_dialog.get()},
+        {"invalid_data", m_invalid_data_dialog.get()},
+        {"printer_settings", &m_sidebar_bed->logical_printer_settings_dialog()},
+        {"printer_add", &m_sidebar_bed->printer_add_dialog()},
+        {"printer_advanced_settings", &m_sidebar_bed->logical_printer_settings_dialog().printer_advanced_settings_dialog()},
+        {"color_mix", &m_sidebar_bed->logical_printer_settings_dialog().color_mix_dialog()},
+        {"material_selection", &m_sidebar_bed->material_selection_dialog()},
+        {"material_settings", &m_sidebar_bed->material_selection_dialog().material_settings_dialog()},
+        {"print_settings", &m_sidebar_print->print_settings_dialog()},
+        {"physical_printer_settings", &m_sidebar_action_buttons->physical_printer_settings_dialog()},
+        {"physical_printer_advanced_settings", &m_sidebar_action_buttons->physical_printer_advanced_settings_dialog()},
+    };
 
     // Init gizmos dialogs
     auto init_gizmo_dialog = [this](Scene::ToolType tool_type, GizmoWindowPtr dialog)

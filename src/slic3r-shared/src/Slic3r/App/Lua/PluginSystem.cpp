@@ -172,7 +172,7 @@ void PluginSystem::finalize_run()
 {
     ASSERT(m_current_plugin_data.has_value());
 
-    ProjectApi project_api(m_project_interactor, m_font_manager);
+    ProjectApi project_api(m_project_interactor, m_font_manager, ProjectApi::Permissions{}, m_ui_host);
     Biz::Lua::LuaEngine lua;
     lua.open_registry([&project_api](auto& lua) { project_api.register_api(lua); });
     PackageRegistry package_registry;
@@ -205,7 +205,7 @@ PluginSystem::ExecutionResult PluginSystem::execute_source(const std::string& so
 {
     ExecutionResult result;
 
-    ProjectApi project_api(m_project_interactor, m_font_manager);
+    ProjectApi project_api(m_project_interactor, m_font_manager, ProjectApi::Permissions{.export_files = true, .import_files = true}, m_ui_host);
     Biz::Lua::LuaEngine lua;
     lua.open_registry([&project_api](auto& lua) { project_api.register_api(lua); });
     PackageRegistry package_registry;
