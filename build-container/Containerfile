@@ -1,0 +1,13 @@
+# Build environment for PrusaSlicer on Fedora 43, used via Podman so nothing is installed on the host.
+# Package list follows the Fedora prerequisites documented in PR #15756, plus GLU, D-Bus and ninja.
+FROM registry.fedoraproject.org/fedora:43
+
+RUN dnf install -y \
+        cmake ninja-build gcc-c++ git-core make m4 texinfo autoconf automake libtool pkgconf-pkg-config \
+        perl-FindBin perl-lib perl-IPC-Cmd perl-Time-Piece \
+        webkit2gtk4.1-devel gtk3-devel mesa-libGLU-devel dbus-devel libsecret-devel \
+        zlib-devel zlib-static libpng-static \
+    && dnf clean all
+
+ENV LANG=C.UTF-8 LC_ALL=C.UTF-8
+WORKDIR /src
