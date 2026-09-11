@@ -391,6 +391,9 @@ void update_volume_from_def(Domain::ModelVolume* added_vol, const sol::table& de
 
 void update_object_from_def(Domain::ModelObject& mo, const sol::table& def)
 {
+    if (const auto name = def.get<std::optional<std::string>>("name"); name.has_value()) {
+        mo.name = *name;
+    }
     if (def["object_params"].valid()) {
         sol::table params = def["object_params"];
         params.for_each(
@@ -1077,6 +1080,7 @@ void ProjectApi::register_api(Biz::Lua::LuaEngine& lua)
     //- local VolumeDefinition = {}
 
     //--@class ObjectDefinition : VolumeDefinition
+    //--@field name? string Name of the new object.
     //--@field object_params? table<string, any> Dictionary of object-specific print settings.
     //--@field other_volumes? VolumeDefinition[] Additional volumes attached to this object.
     //- local ObjectDefinition = {}

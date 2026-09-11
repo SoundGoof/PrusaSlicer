@@ -1253,6 +1253,8 @@ set(SLIC3R_SHARED_FILES
         src/Slic3r/App/Lua/PluginRegistry.cpp
         include/Slic3r/App/Lua/PluginSystem.hpp
         src/Slic3r/App/Lua/PluginSystem.cpp
+        include/Slic3r/App/Lua/PluginServer.hpp
+        src/Slic3r/App/Lua/PluginServer.cpp
         include/Slic3r/App/Lua/PluginDialog.hpp
         src/Slic3r/App/Lua/PluginDialog.cpp
         include/Slic3r/App/Lua/IPluginRescanListener.hpp

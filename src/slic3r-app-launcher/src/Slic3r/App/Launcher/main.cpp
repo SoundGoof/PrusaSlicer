@@ -3,6 +3,7 @@
 #endif
 #ifdef SLIC3R_GUI
 #include "Slic3r/App/Desktop/Run.hpp"
+#include "Slic3r/App/Lua/PluginServer.hpp"
 #endif
 
 #include "Slic3r/App/CLI/CLIApp.hpp"
@@ -123,6 +124,9 @@ int main(int argc, char** argv)
         Slic3r::Biz::Network::ServiceConfig::instance().set_webdev_enabled(
             init_params.misc.webdev.value()
         );
+    }
+    if (init_params.misc.plugin_server.value_or(false)) {
+        Slic3r::App::Lua::PluginServer::set_requested(true);
     }
 #endif
 

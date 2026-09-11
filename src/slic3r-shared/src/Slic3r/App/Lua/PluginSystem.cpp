@@ -1,5 +1,6 @@
 #include "Slic3r/App/Lua/PluginSystem.hpp"
 #include "Slic3r/App/Lua/PluginDialog.hpp"
+#include "Slic3r/App/Lua/PluginServer.hpp"
 #include "Slic3r/App/Lua/ProjectApi.hpp"
 #include "Slic3r/Biz/Lua/LuaException.hpp"
 
@@ -196,6 +197,75 @@ void PluginSystem::finalize_run()
     m_current_plugin_data = std::nullopt;
 
     m_project_interactor.undo_provider().take_snapshot(Biz::UndoSnapshotType::ExecutePlugin);
+}
+
+PluginSystem::~PluginSystem() = default;
+
+PluginSystem::ExecutionResult PluginSystem::execute_source(const std::string& source, const std::string& chunk_name)
+{
+    ExecutionResult result;
+
+    ProjectApi project_api(m_project_interactor, m_font_manager);
+    Biz::Lua::LuaEngine lua;
+    lua.open_registry([&project_api](auto& lua) { project_api.register_api(lua); });
+    PackageRegistry package_registry;
+    lua.open_registry([&package_registry](auto& lua) { package_registry.register_api(lua); });
+
+    // Capture print() instead of writing to stdout.
+    lua.state().set_function("print", [&result](sol::this_state ts, sol::variadic_args args)
+    {
+        sol::state_view view(ts);
+        sol::protected_function tostring = view["tostring"];
+        bool first = true;
+        for (auto arg : args) {
+            if (!first) {
+                result.output += '\t';
+            }
+            first = false;
+            const auto str = tostring(arg);
+            result.output += str.valid() ? str.get<std::string>() : std::string("?");
+        }
+        result.output += '\n';
+    });
+
+    try {
+        sol::protected_function_result ret = lua.state().script(source, sol::script_pass_on_error, chunk_name);
+        if (!ret.valid()) {
+            const sol::error err = ret;
+            result.error = err.what();
+        } else {
+            result.ok = true;
+            if (ret.return_count() > 0) {
+                sol::protected_function tostring = lua.state()["tostring"];
+                const auto str = tostring(ret.get<sol::object>(0));
+                result.result = str.valid() ? str.get<std::string>() : std::string();
+            }
+        }
+    } catch (const Biz::Lua::LuaException& e) {
+        result.error = e.what();
+    } catch (const std::exception& e) {
+        result.error = e.what();
+    }
+
+    m_project_interactor.undo_provider().take_snapshot(Biz::UndoSnapshotType::ExecutePlugin);
+    Biz::Platform::PlatformServices::instance().render_request_handler().request_render();
+    return result;
+}
+
+void PluginSystem::start_server_if_requested()
+{
+    if (!PluginServer::requested() || m_server) {
+        return;
+    }
+    m_server = std::make_unique<PluginServer>(*this);
+    if (!m_server->start()) {
+        m_server.reset();
+    }
+}
+
+void PluginSystem::stop_server()
+{
+    m_server.reset();
 }
 
 void PluginSystem::clear()

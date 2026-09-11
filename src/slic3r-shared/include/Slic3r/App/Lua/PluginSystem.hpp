@@ -1,4 +1,5 @@
 #pragma once
+#include <memory>
 #include <optional>
 #include <string>
 #include <vector>
@@ -14,16 +15,34 @@
 namespace Slic3r::App::Lua {
 
 class PluginDialog;
+class PluginServer;
 
 class PluginSystem : public WithListeners<IPluginRescanListener, IPluginInstallationListener>
 {
 public:
+    struct ExecutionResult
+    {
+        bool ok{false};
+        std::string output; // everything the script printed
+        std::string result; // the chunk's return value, converted with tostring
+        std::string error;  // error message when ok is false
+    };
+
     explicit PluginSystem(
         std::initializer_list<std::string> plugin_paths,
         Biz::ProjectInteractor& project_interactor,
         Biz::Emboss::IFontManager& font_manager
     );
+    ~PluginSystem();
+
     void execute_plugin(const std::string& id);
+
+    /** Run a Lua chunk with the plugin API and sandbox. Must be called on the main thread. */
+    ExecutionResult execute_source(const std::string& source, const std::string& chunk_name);
+
+    /** Start the local plugin server if it was requested on the command line. */
+    void start_server_if_requested();
+    void stop_server();
     void rescan();
     const auto& plugins() const { return m_registry.plugins(); }
 
@@ -47,6 +66,7 @@ private:
     Biz::Emboss::IFontManager& m_font_manager;
     std::optional<PluginData> m_current_plugin_data, m_last_plugin_data;
     Yoga::Passthrough<PluginDialog> m_dialog;
+    std::unique_ptr<PluginServer> m_server;
 };
 
 } // namespace Slic3r::App::Lua

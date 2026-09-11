@@ -155,6 +155,7 @@ struct MiscParams
     std::optional<bool> ignore_nonexistent_config;
     std::optional<bool> single_instance;
     std::optional<bool> webdev;
+    std::optional<bool> plugin_server; // local HTTP server that runs Lua through the plugin system
     std::optional<uint16_t> threads;
 
     std::optional<bool> opengl_aa;

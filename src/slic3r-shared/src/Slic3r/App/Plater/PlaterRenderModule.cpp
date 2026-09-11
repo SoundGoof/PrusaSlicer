@@ -345,6 +345,7 @@ void PlaterRenderModule::on_init(
     init_scene();
 
     m_plugin_system.rescan();
+    m_plugin_system.start_server_if_requested();
 
     init_scene_layout();
     init_dialog_navigation();

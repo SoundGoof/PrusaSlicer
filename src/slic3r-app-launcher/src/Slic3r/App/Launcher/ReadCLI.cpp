@@ -384,6 +384,13 @@ void add_misc_options(CLI::App& app, App::InitParams& params)
         "Enable webdev tools in webview components."
     );
 
+    app.add_flag(
+        "--plugin-server",
+        params.misc.plugin_server,
+        "Start a local HTTP server on 127.0.0.1 that runs Lua code through the plugin system. "
+        "Port and token are written to plugin-server.json in the data directory."
+    );
+
     app.add_option(
            "--threads",
            params.misc.threads,
